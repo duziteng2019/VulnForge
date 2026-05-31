@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vulnforge"
-version = "0.1.0"
+version = "0.2.0"
 description = "AI驱动的自动化漏洞挖掘框架 — 输入目标，坐等报告"
 readme = "README.md"
 license = {text = "MIT"}

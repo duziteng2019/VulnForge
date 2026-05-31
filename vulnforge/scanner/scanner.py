@@ -1,4 +1,4 @@
-"""漏洞扫描模块 — SQL注入 / XSS / SSRF / 命令注入"""
+"""漏洞扫描模块 — SQL注入 / XSS / SSRF / 命令注入 / Nuclei"""
 
 import asyncio
 import json
@@ -71,6 +71,11 @@ class ScannerRunner:
 
         if tasks:
             await asyncio.gather(*tasks)
+
+        # Nuclei扫描（额外深度扫描）
+        nuclei_findings = await self._run_nuclei_scan()
+        if nuclei_findings:
+            self.findings.extend(nuclei_findings)
 
         results = {
             "findings": [f.to_dict() for f in self.findings],
@@ -408,6 +413,40 @@ class ScannerRunner:
                         ))
                 except Exception:
                     continue
+
+    async def _run_nuclei_scan(self) -> list[Finding]:
+        """运行Nuclei深度扫描"""
+        try:
+            from .nuclei_runner import NucleiRunner
+
+            runner = NucleiRunner(self.config, self.target)
+            result = await runner.run(
+                output_dir=Path(self.config.output_dir) / f"scan_{int(asyncio.get_event_loop().time())}",
+                severity="medium,high,critical",
+            )
+
+            findings = []
+            for f in result.get("findings", []):
+                findings.append(Finding(
+                    vuln_type=f.get("vuln_type", "nuclei/unknown"),
+                    url=f.get("url", ""),
+                    param="",
+                    payload="",
+                    severity=f.get("severity", "medium"),
+                    evidence=f.get("name", "") + " | " + (f.get("description", "") or "")[:100],
+                    description=f"Nuclei模板匹配: {f.get('name', 'unknown')}",
+                ))
+
+            if result.get("status") == "skipped":
+                print(f"  [!] Nuclei跳过: {result.get('message', '')}")
+
+            return findings
+
+        except ImportError:
+            return []
+        except Exception as e:
+            print(f"  [!] Nuclei扫描异常: {e}")
+            return []
 
     def _get_test_params(self) -> list[tuple[str, str]]:
         """获取待测试的参数列表"""
