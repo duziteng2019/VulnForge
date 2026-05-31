@@ -75,17 +75,24 @@ pip install -e .
 ```bash
 # 对单个目标进行全链路扫描
 vulnforge scan https://target.com
-
-# 指定扫描阶段
-vulnforge scan https://target.com --mode recon-only    # 仅信息收集
-vulnforge scan https://target.com --mode scan-only     # 仅漏洞扫描
-vulnforge scan https://target.com --mode analyze-only   # 仅AI分析已有结果
-
-# 输出格式
-vulnforge scan https://target.com -o html     # HTML报告
-vulnforge scan https://target.com -o json     # JSON输出
-vulnforge scan https://target.com -o md       # Markdown（默认）
 ```
+
+### 批量扫描
+
+```bash
+# 从文件读取目标列表
+vulnforge scan targets.txt
+
+# 逗号分隔
+vulnforge scan https://site1.com,https://site2.com
+
+# 指定并发数
+vulnforge scan targets.txt --concurrent 5
+```
+
+### 扫描模式
+
+```bash
 
 ### 配置AI模型
 
@@ -111,6 +118,51 @@ vulnforge list
 
 # 查看某次扫描详情
 vulnforge show <scan_id>
+```
+
+---
+
+## 🚀 快速演示
+
+```bash
+# 一键扫描（含AI分析需配置API Key）
+$ vulnforge scan https://httpbin.org/get?id=1 --mode scan-only
+
+🛡️  VulnForge v0.2.0
+🎯  Target: https://httpbin.org/get?id=1
+⚙️   Mode: scan-only
+
+[→] 阶段: scanner
+  [→] Nuclei扫描中 (13,000+ 模板)...
+  [✓] Nuclei发现 0 个漏洞
+  [✓] 发现漏洞: 22 个
+       high: 1
+       medium: 21
+
+[✓] 扫描完成 | 耗时: 12.4s
+
+📊 扫描总结
+==================================================
+  漏洞总数: 22
+    high: 1
+    medium: 21
+  扫描耗时: 12.4s
+```
+
+```bash
+# 批量扫描
+$ vulnforge scan targets.txt --concurrent 3
+🛡️  VulnForge v0.2.0 — 批量扫描模式
+🎯  共 10 个目标
+⚙️   并发: 3
+
+[1/10] 🔍 https://target1.com
+[2/10] 🔍 https://target2.com
+[3/10] 🔍 https://target3.com
+...
+
+📊 批量扫描完成
+  总计: 10 目标, 47 漏洞
 ```
 
 ---
