@@ -39,6 +39,12 @@ DEFAULT_CONFIG = {
         "enable_csrf": True,
         "enable_xxe": True,
         "enable_lfi": True,
+        "enable_graphql": True,
+        "enable_jwt": True,
+        "enable_cors": True,
+        "enable_ssti": True,
+        "enable_redirect": True,
+        "enable_race": True,
         "enable_fuzzing": False,  # 默认关闭，因为 fuzzing 会产生大量请求
         "enable_websocket": True,
         "payload_depth": "normal",

@@ -17,7 +17,7 @@ jobs:
         python-version: '3.11'
     - name: Install dependencies
       run: |
-        pip install -e .
+        pip install -e ".[dev]"
         pip install flake8
     - name: Lint with flake8
       run: |
@@ -36,8 +36,34 @@ jobs:
         python-version: ${{ matrix.python-version }}
     - name: Install dependencies
       run: |
-        pip install -e .
-    - name: Run basic test
+        pip install -e ".[dev]"
+    - name: Run unit tests
+      run: |
+        python -m pytest tests/ -v --tb=short
+    - name: Verify CLI works
       run: |
         vulnforge --help
         vulnforge config init
+
+  security-scan:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+    - name: Install
+      run: |
+        pip install -e ".[dev]"
+    - name: Self-test — scan demo target
+      run: |
+        # Scan a test target and generate SARIF report
+        vulnforge scan https://httpbin.org/get?id=1 --mode scan-only --sarif --fail-on critical || true
+      continue-on-error: true
+    - name: Upload SARIF
+      uses: actions/upload-artifact@v4
+      with:
+        name: sarif-report
+        path: ~/.vulnforge/scans/**/report.sarif
+      continue-on-error: true

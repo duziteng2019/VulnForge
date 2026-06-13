@@ -37,7 +37,9 @@ def main():
 @click.option("--sarif", is_flag=True, help="输出 SARIF 格式报告（GitHub Code Scanning 兼容）")
 @click.option("--fail-on", default="", help="漏洞级别达到此值则 exit 1 (如 'high,critical')")
 @click.option("--ws/--no-ws", default=True, help="启用/禁用 WebSocket 安全测试")
-def scan(targets: str, mode: str, output: str, config: str, verbose: bool, concurrent: int, cookie: str, auth_url: str, auth_data: str, auth_username: str, auth_password: str, oob_domain: str, fuzz: bool, sarif: bool, fail_on: str, ws: bool):
+@click.option("--ssti/--no-ssti", default=True, help="启用/禁用 SSTI 模板注入检测")
+@click.option("--redirect/--no-redirect", default=True, help="启用/禁用 Open Redirect 检测")
+def scan(targets: str, mode: str, output: str, config: str, verbose: bool, concurrent: int, cookie: str, auth_url: str, auth_data: str, auth_username: str, auth_password: str, oob_domain: str, fuzz: bool, sarif: bool, fail_on: str, ws: bool, ssti: bool, redirect: bool):
     """🔍 对目标URL进行自动化漏洞扫描"""
     target_list = _resolve_targets(targets)
     if not target_list:
@@ -70,6 +72,8 @@ def scan(targets: str, mode: str, output: str, config: str, verbose: bool, concu
     if fuzz:
         cfg.set("scanner.enable_fuzzing", True)
     cfg.set("scanner.enable_websocket", ws)
+    cfg.set("scanner.enable_ssti", ssti)
+    cfg.set("scanner.enable_redirect", redirect)
 
     if not cfg.get("api_key") and mode in ("full", "analyze-only"):
         click.echo("⚠️  未配置AI API Key，将使用本地规则分析（功能受限）")

@@ -62,6 +62,12 @@ class ScannerRunner:
         enable_browser: bool = False,
         enable_fuzzing: bool = False,
         enable_websocket: bool = False,
+        enable_jwt: bool = False,
+        enable_cors: bool = False,
+        enable_graphql: bool = False,
+        enable_ssti: bool = False,
+        enable_redirect: bool = False,
+        enable_race: bool = False,
     ):
         self.config = config
         self.target = target
@@ -70,6 +76,12 @@ class ScannerRunner:
         self.enable_browser = enable_browser
         self.enable_fuzzing = enable_fuzzing
         self.enable_websocket = enable_websocket
+        self.enable_jwt = enable_jwt
+        self.enable_cors = enable_cors
+        self.enable_graphql = enable_graphql
+        self.enable_ssti = enable_ssti
+        self.enable_redirect = enable_redirect
+        self.enable_race = enable_race
         self.findings: list[Finding] = []
         self._seen: set[tuple[str, str, str, str]] = set()
         self.logger = logging.getLogger(__name__)
@@ -188,6 +200,29 @@ class ScannerRunner:
             tasks.append(self._scan_xxe())
         if self.config.get("scanner.enable_lfi", True):
             tasks.append(self._scan_lfi())
+
+        if self.enable_graphql or self.config.get("scanner.enable_graphql", True):
+            tasks.append(self._scan_graphql())
+
+        # JWT 安全测试
+        if self.enable_jwt or self.config.get("scanner.enable_jwt", True):
+            tasks.append(self._scan_jwt())
+
+        # CORS 配置检查
+        if self.enable_cors or self.config.get("scanner.enable_cors", True):
+            tasks.append(self._scan_cors())
+
+        # SSTI 模板注入检测
+        if self.enable_ssti or self.config.get("scanner.enable_ssti", True):
+            tasks.append(self._scan_ssti())
+
+        # Open Redirect 检测
+        if self.enable_redirect or self.config.get("scanner.enable_redirect", True):
+            tasks.append(self._scan_redirect())
+
+        # Race Condition 检测
+        if self.enable_race or self.config.get("scanner.enable_race", True):
+            tasks.append(self._scan_race())
 
         if tasks:
             await asyncio.gather(*tasks)
@@ -1121,6 +1156,119 @@ class ScannerRunner:
             self.logger.debug("  [!] websockets 库未安装，跳过 WebSocket 测试")
             return []
 
+    async def _scan_graphql(self) -> None:
+        """GraphQL 安全测试
+
+        检测:
+        - Introspection 是否开启
+        - 深度嵌套查询 DoS
+        - 认证绕过
+        - Mutations 发现
+        """
+        self.logger.info("  [GraphQL] 开始 GraphQL 安全测试")
+
+        # 1. 从 recon 结果中提取可能包含 GraphQL 端点的路径
+        graphql_paths = []
+        if self.recon_results:
+            raw_endpoints = self.recon_results.get("endpoints", [])
+            if isinstance(raw_endpoints, list):
+                for ep in raw_endpoints:
+                    if isinstance(ep, str):
+                        # 检查 URL 路径中是否包含 graphql 关键词
+                        path_lower = ep.lower()
+                        if any(
+                            kw in path_lower
+                            for kw in [
+                                "graphql",
+                                "graphiql",
+                                "/gql",
+                                "/query",
+                                "/voyager",
+                            ]
+                        ):
+                            graphql_paths.append(ep)
+                    elif isinstance(ep, dict):
+                        ep_url = ep.get("url", "")
+                        path_lower = ep_url.lower()
+                        if any(
+                            kw in path_lower
+                            for kw in [
+                                "graphql",
+                                "graphiql",
+                                "/gql",
+                                "/query",
+                                "/voyager",
+                            ]
+                        ):
+                            graphql_paths.append(ep_url)
+
+            # 也检查 forms 中的 action URLs
+            forms = self.recon_results.get("forms", [])
+            if isinstance(forms, list):
+                for form in forms:
+                    if isinstance(form, dict):
+                        action = form.get("action", "")
+                        path_lower = action.lower()
+                        if any(
+                            kw in path_lower
+                            for kw in [
+                                "graphql",
+                                "graphiql",
+                                "/gql",
+                                "/query",
+                                "/voyager",
+                            ]
+                        ):
+                            graphql_paths.append(action)
+
+        # 2. 从目录扫描结果中找出 GraphQL 相关路径
+        for f in self.findings:
+            if f.vuln_type == "exposed_path":
+                url_lower = f.url.lower()
+                if any(
+                    kw in url_lower
+                    for kw in [
+                        "graphql",
+                        "graphiql",
+                        "/gql",
+                        "/query",
+                        "/voyager",
+                    ]
+                ):
+                    if f.url not in graphql_paths:
+                        graphql_paths.append(f.url)
+
+        # 3. 执行 GraphQL 测试
+        try:
+            from ..utils.graphql import GraphQLTester, COMMON_GRAPHQL_ENDPOINTS
+
+            tester = GraphQLTester(self.config, self.target)
+
+            # 如果有从 recon 中发现的 GraphQL 路径，将其加入探测列表
+            if graphql_paths:
+                # 将发现的路径转换为端点路径
+                for gp in graphql_paths:
+                    from urllib.parse import urlparse
+
+                    parsed = urlparse(gp)
+                    path = parsed.path or "/"
+                    if path not in tester.endpoints:
+                        tester.endpoints.append(path)
+
+            raw_findings = await tester.run(self.client)
+            for rf in raw_findings:
+                self._add_finding(Finding(
+                    vuln_type=rf.get("vuln_type", "graphql/unknown"),
+                    url=rf.get("url", ""),
+                    severity=rf.get("severity", "medium"),
+                    evidence=rf.get("evidence", ""),
+                    description=rf.get("description", ""),
+                ))
+        except ImportError:
+            self.logger.debug("  [!] graphql 模块导入失败，跳过 GraphQL 测试")
+        except Exception as e:
+            self.logger.warning(f"  [!] GraphQL 测试异常: {e}")
+
     def _get_test_params(self) -> list[tuple[str, str]]:
         """获取待测试的参数列表"""
         params = []
@@ -1189,3 +1337,197 @@ class ScannerRunner:
                     ))
                 except Exception:
                     continue
+
+    async def _scan_jwt(self) -> None:
+        """JWT 安全测试 — 检测算法绕过/弱密钥/算法混淆/Header注入"""
+        self.logger.info("  [JWT] 开始 JWT 安全测试")
+
+        jwt_token = None
+
+        # 1. 从 Authorization header 提取 JWT
+        auth_header = self.client.headers.get("Authorization", "")
+        if auth_header.lower().startswith("bearer "):
+            jwt_token = auth_header[7:].strip()
+
+        # 2. 如果客户端有 cookie，检查其中是否包含 JWT
+        if not jwt_token:
+            for cookie in self.client.cookies.jar:
+                # 常见的 JWT cookie 名称
+                if cookie.name.lower() in ("token", "jwt", "access_token", "id_token", "auth_token", "session"):
+                    val = cookie.value
+                    if val and val.count(".") == 2:
+                        jwt_token = val
+                        break
+
+        if not jwt_token:
+            self.logger.debug("  [JWT] 未发现 JWT，尝试从响应中提取")
+
+        if not jwt_token:
+            self.logger.info("  [JWT] 无可用 JWT，跳过测试")
+            return
+
+        self.logger.info(f"  [JWT] 发现 JWT token，开始安全测试")
+        try:
+            from ..utils.jwt_tester import JWTTester
+            tester = JWTTester(self.config, self.target)
+            raw_findings = await tester.run(self.client, jwt_token)
+            for rf in raw_findings:
+                self._add_finding(Finding(
+                    vuln_type=rf.get("vuln_type", "jwt/unknown"),
+                    url=rf.get("url", self.target.base_url),
+                    severity=rf.get("severity", "medium"),
+                    evidence=rf.get("evidence", ""),
+                    description=rf.get("description", ""),
+                ))
+            if raw_findings:
+                self.logger.info(f"  [JWT] 发现 {len(raw_findings)} 个安全问题")
+        except ImportError:
+            self.logger.debug("  [!] jwt_tester 模块导入失败，跳过 JWT 测试")
+        except Exception as e:
+            self.logger.warning(f"  [!] JWT 测试异常: {e}")
+
+    async def _scan_cors(self) -> None:
+        """CORS 安全配置检查"""
+        self.logger.info("  [CORS] 开始 CORS 配置检查")
+        try:
+            from ..utils.cors import CORSChecker
+            checker = CORSChecker(self.config, self.target)
+            raw_findings = await checker.run(self.client, self.target.base_url)
+            for rf in raw_findings:
+                self._add_finding(Finding(
+                    vuln_type=rf.get("vuln_type", "cors/unknown"),
+                    url=rf.get("url", self.target.base_url),
+                    severity=rf.get("severity", "medium"),
+                    evidence=rf.get("evidence", ""),
+                    description=rf.get("description", ""),
+                ))
+            if raw_findings:
+                self.logger.info(f"  [CORS] 发现 {len(raw_findings)} 个配置问题")
+        except ImportError:
+            self.logger.debug("  [!] cors 模块导入失败，跳过 CORS 检查")
+        except Exception as e:
+            self.logger.warning(f"  [!] CORS 检查异常: {e}")
+
+    async def _scan_ssti(self) -> None:
+        """SSTI 模板注入检测"""
+        self.logger.info("  [SSTI] 开始 SSTI 模板注入检测")
+        try:
+            from ..utils.ssti import SSTITester
+
+            params = self._get_test_params()
+            if not params:
+                self.logger.debug("  [SSTI] 无可用参数，跳过")
+                return
+
+            tester = SSTITester(self.config, self.target)
+            raw_findings = await tester.run(self.client, self.target.base_url, params)
+            for rf in raw_findings:
+                self._add_finding(Finding(
+                    vuln_type=rf.get("vuln_type", "ssti/unknown"),
+                    url=rf.get("url", self.target.base_url),
+                    param=rf.get("param", ""),
+                    payload=rf.get("payload", ""),
+                    severity=rf.get("severity", "high"),
+                    evidence=rf.get("evidence", ""),
+                    description=rf.get("description", ""),
+                ))
+            if raw_findings:
+                self.logger.info(f"  [SSTI] 发现 {len(raw_findings)} 个 SSTI 漏洞")
+        except ImportError:
+            self.logger.debug("  [!] ssti 模块导入失败，跳过 SSTI 检测")
+        except Exception as e:
+            self.logger.warning(f"  [!] SSTI 检测异常: {e}")
+
+    async def _scan_redirect(self) -> None:
+        """Open Redirect 检测"""
+        self.logger.info("  [OpenRedirect] 开始 Open Redirect 检测")
+        try:
+            from ..utils.redirect import OpenRedirectTester
+
+            tester = OpenRedirectTester(self.config, self.target)
+            raw_findings = await tester.run(self.client, self.target.base_url)
+            for rf in raw_findings:
+                self._add_finding(Finding(
+                    vuln_type=rf.get("vuln_type", "open_redirect/unknown"),
+                    url=rf.get("url", self.target.base_url),
+                    param=rf.get("param", ""),
+                    payload=rf.get("payload", ""),
+                    severity=rf.get("severity", "medium"),
+                    evidence=rf.get("evidence", ""),
+                    description=rf.get("description", ""),
+                ))
+            if raw_findings:
+                self.logger.info(f"  [OpenRedirect] 发现 {len(raw_findings)} 个 Open Redirect 漏洞")
+        except ImportError:
+            self.logger.debug("  [!] redirect 模块导入失败，跳过 Open Redirect 检测")
+        except Exception as e:
+            self.logger.warning(f"  [!] Open Redirect 检测异常: {e}")
+
+    async def _scan_race(self) -> None:
+        """Race Condition 检测 — 从 recon endpoints/forms 收集 POST 端点并发测试"""
+        self.logger.info("  [Race] 开始 Race Condition 检测")
+
+        # 从 recon 结果中收集 POST 端点
+        post_endpoints: list[dict] = []
+        seen_urls: set[str] = set()
+
+        # 1. 从 endpoints 列表中收集 POST 端点
+        raw_endpoints = self.recon_results.get("endpoints", [])
+        if isinstance(raw_endpoints, list):
+            for ep in raw_endpoints:
+                if isinstance(ep, dict):
+                    method = ep.get("method", "POST").upper()
+                    url = ep.get("url", "")
+                    if method == "POST" and url and url not in seen_urls:
+                        seen_urls.add(url)
+                        post_endpoints.append(ep)
+                elif isinstance(ep, str):
+                    # 字符串格式的端点，默认当作 GET，跳过
+                    pass
+
+        # 2. 从 forms 列表中收集 POST 表单
+        forms = self.recon_results.get("forms", [])
+        if isinstance(forms, list):
+            for form in forms:
+                if isinstance(form, dict):
+                    method = form.get("method", "get").lower()
+                    action = form.get("action", "")
+                    inputs = form.get("inputs", [])
+                    if method == "post" and action and action not in seen_urls:
+                        seen_urls.add(action)
+                        # 构建 POST data
+                        data = {}
+                        if inputs:
+                            for inp in inputs:
+                                if isinstance(inp, str):
+                                    data[inp] = "test"
+                        post_endpoints.append({
+                            "url": action,
+                            "method": "POST",
+                            "data": data,
+                        })
+
+        if not post_endpoints:
+            self.logger.debug("  [Race] 未发现 POST 端点，跳过检测")
+            return
+
+        self.logger.info(f"  [Race] 收集到 {len(post_endpoints)} 个 POST 端点")
+
+        try:
+            from ..utils.race import RaceConditionTester
+            tester = RaceConditionTester(self.config, self.target)
+            raw_findings = await tester.run(self.client, post_endpoints)
+            for rf in raw_findings:
+                self._add_finding(Finding(
+                    vuln_type=rf.get("vuln_type", "race_condition"),
+                    url=rf.get("url", ""),
+                    severity=rf.get("severity", "high"),
+                    evidence=rf.get("evidence", ""),
+                    description=rf.get("description", ""),
+                ))
+            if raw_findings:
+                self.logger.info(f"  [Race] 发现 {len(raw_findings)} 个可能的 Race Condition 漏洞")
+        except ImportError:
+            self.logger.debug("  [!] race 模块导入失败，跳过 Race Condition 检测")
+        except Exception as e:
+            self.logger.warning(f"  [!] Race Condition 检测异常: {e}")
