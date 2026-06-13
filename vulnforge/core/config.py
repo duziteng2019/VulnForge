@@ -38,6 +38,17 @@ DEFAULT_CONFIG = {
         "enable_dir_scan": True,
         "payload_depth": "normal",
     },
+    "auth": {
+        "cookie": "",
+        "auth_url": "",
+        "auth_data": "",
+        "auth_username": "",
+        "auth_password": "",
+    },
+    "oob": {
+        "enabled": True,
+        "domain": "",
+    },
     "ai": {
         "enable_analysis": True,
         "enable_poc_generation": True,
@@ -94,6 +105,42 @@ def create_shared_client(
         client_kwargs["proxy"] = proxy_url
 
     return httpx.AsyncClient(**client_kwargs)
+
+
+async def create_authenticated_client(config: 'VulnForgeConfig', timeout: int = 30) -> httpx.AsyncClient:
+    """创建已认证的共享 client
+
+    1. 如果 config 有 cookie 字符串，解析并设置到 CookieJar
+    2. 如果 config 有 auth_url + auth_data，POST 到 auth_url 获取 cookie
+    3. 如果 config 有 auth_url + auth_username/auth_password，构造表单并 POST
+    4. 均不满足则返回普通 client
+    """
+    client = httpx.AsyncClient(
+        timeout=timeout,
+        verify=False,
+        follow_redirects=True,
+    )
+
+    cookie_str = config.get("auth.cookie", "")
+    if cookie_str:
+        from http.cookies import SimpleCookie
+        c = SimpleCookie()
+        c.load(cookie_str)
+        for key, morsel in c.items():
+            client.cookies.set(key, morsel.value)
+
+    auth_url = config.get("auth.auth_url", "")
+    if auth_url:
+        auth_data = config.get("auth.auth_data", "")
+        if not auth_data:
+            username = config.get("auth.auth_username", "")
+            password = config.get("auth.auth_password", "")
+            if username and password:
+                auth_data = f"username={username}&password={password}"
+        if auth_data:
+            await client.post(auth_url, data=auth_data)
+
+    return client
 
 
 _LOGGER_INITIALIZED: set = set()

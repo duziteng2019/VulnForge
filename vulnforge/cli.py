@@ -27,7 +27,13 @@ def main():
 @click.option("--config", type=click.Path(), help="配置文件路径")
 @click.option("--verbose", is_flag=True, help="详细输出")
 @click.option("--concurrent", default=3, help="批量扫描并发数（默认3）")
-def scan(targets: str, mode: str, output: str, config: str, verbose: bool, concurrent: int):
+@click.option("--cookie", help="Cookie字符串 (如 'SESSION=abc123; token=xyz')")
+@click.option("--auth-url", help="登录URL，用于自动获取Cookie")
+@click.option("--auth-data", help="登录POST数据 (如 'username=admin&password=xxx')")
+@click.option("--auth-username", help="登录用户名")
+@click.option("--auth-password", help="登录密码")
+@click.option("--oob-domain", help="OOB 回调域名 (如 oast.fun, 或自定义域名)")
+def scan(targets: str, mode: str, output: str, config: str, verbose: bool, concurrent: int, cookie: str, auth_url: str, auth_data: str, auth_username: str, auth_password: str, oob_domain: str):
     """🔍 对目标URL进行自动化漏洞扫描"""
     target_list = _resolve_targets(targets)
     if not target_list:
@@ -43,6 +49,20 @@ def scan(targets: str, mode: str, output: str, config: str, verbose: bool, concu
         click.echo("")
 
     cfg = VulnForgeConfig.load(config) if config else VulnForgeConfig.load()
+
+    # 设置 auth 参数（如有）
+    if cookie:
+        cfg.set("auth.cookie", cookie)
+    if auth_url:
+        cfg.set("auth.auth_url", auth_url)
+    if auth_data:
+        cfg.set("auth.auth_data", auth_data)
+    if auth_username:
+        cfg.set("auth.auth_username", auth_username)
+    if auth_password:
+        cfg.set("auth.auth_password", auth_password)
+    if oob_domain:
+        cfg.set("oob.domain", oob_domain)
 
     if not cfg.get("api_key") and mode in ("full", "analyze-only"):
         click.echo("⚠️  未配置AI API Key，将使用本地规则分析（功能受限）")

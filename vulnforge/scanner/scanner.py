@@ -12,6 +12,7 @@ import httpx
 
 from ..core.config import VulnForgeConfig
 from ..core.target import Target
+from ..utils.oob import OOBDetector
 
 
 class Finding:
@@ -55,10 +56,12 @@ class ScannerRunner:
         config: VulnForgeConfig,
         target: Target,
         client: Optional[httpx.AsyncClient] = None,
+        oob: Optional[OOBDetector] = None,
     ):
         self.config = config
         self.target = target
         self.client = client
+        self.oob = oob
         self.findings: list[Finding] = []
         self._seen: set[tuple[str, str, str, str]] = set()
         self.logger = logging.getLogger(__name__)
@@ -109,6 +112,8 @@ class ScannerRunner:
             tasks.append(self._scan_cmd_injection())
         if self.config.get("scanner.enable_dir_scan", True):
             tasks.append(self._scan_directories())
+        if self.oob:
+            tasks.append(self._scan_oob())
 
         if tasks:
             await asyncio.gather(*tasks)
@@ -250,6 +255,30 @@ class ScannerRunner:
                     ))
             except Exception:
                 continue
+
+        # --- OOB SQLi 测试 ---
+        if self.oob:
+            oob_payloads = self.oob.get_sqli_oob_payloads()
+            for param_name, param_value in self._get_test_params():
+                for payload, label in oob_payloads:
+                    try:
+                        test_url = self._inject_param(param_name, param_value, payload)
+                        await self.client.get(
+                            test_url,
+                            follow_redirects=False,
+                            timeout=10,
+                        )
+                        self._add_finding(Finding(
+                            vuln_type="sql_injection_oob",
+                            url=test_url,
+                            param=param_name,
+                            payload=payload,
+                            severity="high",
+                            evidence=f"OOB SQLi payload已发送: {label}",
+                            description=f"SQL注入 OOB ({label}) — 参数 {param_name}，等待回调验证",
+                        ))
+                    except Exception:
+                        continue
 
         # --- POST 测试（基于侦察阶段发现的表单）---
         forms = self.recon_results.get("forms", [])
@@ -430,6 +459,39 @@ class ScannerRunner:
                     pass
                 except Exception:
                     continue
+
+        # --- OOB SSRF 测试 ---
+        if self.oob:
+            oob_payloads = self.oob.get_ssrf_oob_payloads()
+            for param_name, param_value in self._get_test_params():
+                param_lower = param_name.lower()
+                is_url_param = any(
+                    kw in param_lower
+                    for kw in ["url", "uri", "link", "src", "href", "file",
+                               "path", "dest", "redirect", "next", "load",
+                               "image", "img", "source", "download", "data"]
+                )
+                if not is_url_param:
+                    continue
+                for payload, label in oob_payloads:
+                    try:
+                        test_url = self._inject_param(param_name, param_value, payload)
+                        await self.client.get(
+                            test_url,
+                            follow_redirects=False,
+                            timeout=10,
+                        )
+                        self._add_finding(Finding(
+                            vuln_type="ssrf_oob",
+                            url=test_url,
+                            param=param_name,
+                            payload=payload,
+                            severity="high",
+                            evidence=f"OOB SSRF payload已发送: {label}",
+                            description=f"SSRF OOB ({label}) — 参数 {param_name}，等待回调验证",
+                        ))
+                    except Exception:
+                        continue
 
     async def _scan_cmd_injection(self) -> None:
         """命令注入检测"""
@@ -648,3 +710,31 @@ class ScannerRunner:
             # 添加新参数
             sep = "&" if "?" in self.target.url else "?"
             return f"{self.target.url}{sep}{param_name}={payload}"
+
+    async def _scan_oob(self) -> None:
+        """OOB 命令注入检测 — 使用 OOB payload 测试所有参数"""
+        if not self.oob:
+            return
+        oob_payloads = self.oob.get_cmd_oob_payloads()
+        if not oob_payloads:
+            return
+        for param_name, param_value in self._get_test_params():
+            for payload, label in oob_payloads:
+                try:
+                    test_url = self._inject_param(param_name, param_value, payload)
+                    await self.client.get(
+                        test_url,
+                        follow_redirects=False,
+                        timeout=10,
+                    )
+                    self._add_finding(Finding(
+                        vuln_type="command_injection_oob",
+                        url=test_url,
+                        param=param_name,
+                        payload=payload,
+                        severity="critical",
+                        evidence=f"OOB CMD payload已发送: {label}",
+                        description=f"命令注入 OOB ({label}) — 参数 {param_name}，等待回调验证",
+                    ))
+                except Exception:
+                    continue

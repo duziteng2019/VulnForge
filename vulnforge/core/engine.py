@@ -10,8 +10,9 @@ from datetime import datetime
 
 import httpx
 
-from .config import VulnForgeConfig
+from .config import VulnForgeConfig, create_authenticated_client
 from .target import Target
+from ..utils.oob import OOBDetector
 
 logger = logging.getLogger(__name__)
 
@@ -59,19 +60,41 @@ class ScanEngine:
         if mode in ("full", "analyze-only"):
             stages.append("ai")
 
-        async with httpx.AsyncClient(timeout=timeout, verify=False) as client:
+        client = await create_authenticated_client(self.config, timeout=timeout)
+
+        # OOB 检测器初始化
+        oob = None
+        if self.config.get("oob.enabled", True):
+            oob_domain = self.config.get("oob.domain", "")
+            oob = OOBDetector(scan_id=self.scan_id, callback_domain=oob_domain)
+            await oob.register(oob_domain)
+            self.logger.info("OOB 检测已启用 | 回调域名: %s", oob.callback_full)
+
+        try:
             for stage in stages:
                 self.logger.info("阶段: %s", stage)
                 try:
                     if stage == "recon":
                         self.results["recon"] = await self._run_recon(self.output_dir, client)
                     elif stage == "scanner":
-                        self.results["scanner"] = await self._run_scanner(self.output_dir, client)
+                        self.results["scanner"] = await self._run_scanner(self.output_dir, client, oob=oob)
                     elif stage == "ai":
                         self.results["ai"] = await self._run_ai_analysis(self.output_dir, client)
                 except Exception as e:
                     self.logger.error("阶段 %s 出错: %s", stage, e)
                     self.results[stage] = {"error": str(e)}
+        finally:
+            await client.aclose()
+
+        # OOB 轮询 — 等待回调
+        if oob and self.config.get("oob.enabled", True):
+            self.logger.info("OOB 轮询等待回调...")
+            oob_findings = await oob.poll()
+            if oob_findings:
+                self.results["oob"] = {"findings": oob_findings}
+                self.logger.info("OOB 回调发现 %d 个结果", len(oob_findings))
+            else:
+                self.logger.info("OOB 未检测到回调")
 
         # 生成总结
         elapsed = time.time() - self.start_time
@@ -89,10 +112,10 @@ class ScanEngine:
         runner = ReconRunner(self.config, self.target)
         return await runner.run(output_dir)
 
-    async def _run_scanner(self, output_dir: Path, client: httpx.AsyncClient) -> dict:
+    async def _run_scanner(self, output_dir: Path, client: httpx.AsyncClient, oob=None) -> dict:
         """漏洞扫描阶段"""
         from ..scanner import ScannerRunner
-        runner = ScannerRunner(self.config, self.target, client=client)
+        runner = ScannerRunner(self.config, self.target, client=client, oob=oob)
         recon_results = self.results.get("recon", {})
         return await runner.run(output_dir, client=client, recon_results=recon_results)
 
