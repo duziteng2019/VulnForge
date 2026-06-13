@@ -1,4 +1,4 @@
-"""漏洞扫描模块 — SQL注入 / XSS / SSRF / 命令注入 / Nuclei"""
+"""漏洞扫描模块 — SQL注入 / XSS / SSRF / 命令注入 / Nuclei + WAF 识别"""
 
 import asyncio
 import json
@@ -12,6 +12,7 @@ import httpx
 
 from ..core.config import VulnForgeConfig
 from ..core.target import Target
+from ..utils.waf import WAFDetector
 from ..utils.oob import OOBDetector
 
 
@@ -67,6 +68,14 @@ class ScannerRunner:
         self.logger = logging.getLogger(__name__)
         self.recon_results: dict = {}
 
+        # 速率限制 + User-Agent 轮换
+        from ..utils.rate import AdaptiveRateLimiter, random_user_agent
+        self.rate_limiter = AdaptiveRateLimiter(
+            initial_concurrency=config.get("max_concurrent", 5),
+        )
+        self.rate_limiter_uas = random_user_agent()
+        self.rate_limiter_initialized = False
+
     def _add_finding(self, finding: Finding) -> None:
         """添加发现，去重检查"""
         key = (finding.vuln_type, finding.url, finding.param, finding.payload)
@@ -99,6 +108,47 @@ class ScannerRunner:
 
         self.client = effective_client
         self.recon_results = recon_results or {}
+
+        # 初始化速率限制 + User-Agent
+        self.client.headers.update({"User-Agent": self.rate_limiter_uas})
+        self.rate_limiter_initialized = True
+
+        # WAF 检测
+        self.waf_detector = WAFDetector()
+        try:
+            detected_waf = await self.waf_detector.detect(
+                self.client, self.target.base_url
+            )
+            if detected_waf:
+                self.logger.info("WAF 检测结果: %s", self.waf_detector.get_summary())
+                self.waf_name = detected_waf
+                self.findings.append(Finding(
+                    vuln_type="waf_detected",
+                    url=self.target.base_url,
+                    severity="info",
+                    evidence=f"WAF: {self.waf_detector.get_summary()}",
+                    description=f"检测到 Web 应用防火墙: {self.waf_detector.get_summary()}",
+                ))
+        except Exception as e:
+            self.logger.debug("WAF 检测异常: %s", e)
+            self.waf_detector = None
+
+        async def _rate_limited_get(url, **kwargs):
+            """带速率限制和 UA 轮换的 GET 请求"""
+            from ..utils.rate import random_user_agent
+            import time
+            await self.rate_limiter.wait_if_needed()
+            t0 = time.time()
+            self.client.headers.update({"User-Agent": random_user_agent()})
+            try:
+                resp = await self._get(url, **kwargs)
+                self.rate_limiter.record_response_time(time.time() - t0)
+                return resp
+            except Exception:
+                raise
+
+        # 替换 self.client.get 为带速率限制的版本
+        self._get = _rate_limited_get
 
         tasks = []
 
@@ -197,41 +247,47 @@ class ScannerRunner:
         # --- GET 测试 ---
         for param_name, param_value in self._get_test_params():
             for payload, label in payloads:
-                try:
-                    test_url = self._inject_param(param_name, param_value, payload)
-                    resp = await self.client.get(
-                        test_url,
-                        follow_redirects=False,
-                        timeout=10,
-                    )
-                    body = resp.text
-                    for pattern in error_patterns:
-                        if re.search(pattern, body, re.IGNORECASE):
-                            self._add_finding(Finding(
-                                vuln_type="sql_injection",
-                                url=test_url,
-                                param=param_name,
-                                payload=payload,
-                                severity="high",
-                                evidence=f"匹配到错误模式: {pattern}",
-                                description=f"SQL注入漏洞 ({label}) — 参数 {param_name} 存在注入风险",
-                            ))
-                            break
-                except Exception:
-                    continue
+                # WAF 绕过变种
+                test_items = [(payload, label)]
+                if self.waf_detector and self.waf_detector.detected_waf:
+                    for variant, desc in self.waf_detector.get_bypass_variants(payload):
+                        test_items.append((variant, f"{label}[{desc}]"))
+                for payload, label in test_items:
+                    try:
+                        test_url = self._inject_param(param_name, param_value, payload)
+                        resp = await self._get(
+                            test_url,
+                            follow_redirects=False,
+                            timeout=10,
+                        )
+                        body = resp.text
+                        for pattern in error_patterns:
+                            if re.search(pattern, body, re.IGNORECASE):
+                                self._add_finding(Finding(
+                                    vuln_type="sql_injection",
+                                    url=test_url,
+                                    param=param_name,
+                                    payload=payload,
+                                    severity="high",
+                                    evidence=f"匹配到错误模式: {pattern}",
+                                    description=f"SQL注入漏洞 ({label}) — 参数 {param_name} 存在注入风险",
+                                ))
+                                break
+                    except Exception:
+                        continue
 
         # --- GET 时间盲注检测 ---
         for param_name, param_value in self._get_test_params():
             try:
                 start = asyncio.get_event_loop().time()
                 normal_url = self._inject_param(param_name, param_value, "1")
-                await self.client.get(normal_url, timeout=10)
+                await self._get(normal_url, timeout=10)
                 normal_time = asyncio.get_event_loop().time() - start
 
                 start = asyncio.get_event_loop().time()
                 delay_url = self._inject_param(param_name, param_value, "' AND SLEEP(4)-- ")
                 try:
-                    await self.client.get(delay_url, timeout=15)
+                    await self._get(delay_url, timeout=15)
                     delay_time = asyncio.get_event_loop().time() - start
                     if delay_time > normal_time + 3:
                         self._add_finding(Finding(
@@ -263,7 +319,7 @@ class ScannerRunner:
                 for payload, label in oob_payloads:
                     try:
                         test_url = self._inject_param(param_name, param_value, payload)
-                        await self.client.get(
+                        await self._get(
                             test_url,
                             follow_redirects=False,
                             timeout=10,
@@ -339,7 +395,7 @@ class ScannerRunner:
             for payload, label in payloads:
                 try:
                     test_url = self._inject_param(param_name, param_value, payload)
-                    resp = await self.client.get(
+                    resp = await self._get(
                         test_url,
                         follow_redirects=False,
                         timeout=10,
@@ -437,7 +493,7 @@ class ScannerRunner:
             for payload, label in payloads:
                 try:
                     test_url = self._inject_param(param_name, param_value, payload)
-                    resp = await self.client.get(
+                    resp = await self._get(
                         test_url,
                         follow_redirects=False,
                         timeout=10,
@@ -476,7 +532,7 @@ class ScannerRunner:
                 for payload, label in oob_payloads:
                     try:
                         test_url = self._inject_param(param_name, param_value, payload)
-                        await self.client.get(
+                        await self._get(
                             test_url,
                             follow_redirects=False,
                             timeout=10,
@@ -517,7 +573,7 @@ class ScannerRunner:
             for payload, label in payloads:
                 try:
                     test_url = self._inject_param(param_name, param_value, payload)
-                    resp = await self.client.get(
+                    resp = await self._get(
                         test_url,
                         follow_redirects=False,
                         timeout=10,
@@ -613,7 +669,7 @@ class ScannerRunner:
         for path in common_paths:
             try:
                 url = self.target.resolve_path(path)
-                resp = await self.client.get(url, follow_redirects=False, timeout=5)
+                resp = await self._get(url, follow_redirects=False, timeout=5)
 
                 if resp.status_code in (200, 204, 301, 302, 307, 401, 403):
                     if resp.status_code == 200:
@@ -722,7 +778,7 @@ class ScannerRunner:
             for payload, label in oob_payloads:
                 try:
                     test_url = self._inject_param(param_name, param_value, payload)
-                    await self.client.get(
+                    await self._get(
                         test_url,
                         follow_redirects=False,
                         timeout=10,
