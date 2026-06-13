@@ -33,7 +33,10 @@ def main():
 @click.option("--auth-username", help="登录用户名")
 @click.option("--auth-password", help="登录密码")
 @click.option("--oob-domain", help="OOB 回调域名 (如 oast.fun, 或自定义域名)")
-def scan(targets: str, mode: str, output: str, config: str, verbose: bool, concurrent: int, cookie: str, auth_url: str, auth_data: str, auth_username: str, auth_password: str, oob_domain: str):
+@click.option("--fuzz", is_flag=True, help="启用参数模糊测试（响应差异分析）")
+@click.option("--sarif", is_flag=True, help="输出 SARIF 格式报告（GitHub Code Scanning 兼容）")
+@click.option("--fail-on", default="", help="漏洞级别达到此值则 exit 1 (如 'high,critical')")
+def scan(targets: str, mode: str, output: str, config: str, verbose: bool, concurrent: int, cookie: str, auth_url: str, auth_data: str, auth_username: str, auth_password: str, oob_domain: str, fuzz: bool, sarif: bool, fail_on: str):
     """🔍 对目标URL进行自动化漏洞扫描"""
     target_list = _resolve_targets(targets)
     if not target_list:
@@ -63,6 +66,8 @@ def scan(targets: str, mode: str, output: str, config: str, verbose: bool, concu
         cfg.set("auth.auth_password", auth_password)
     if oob_domain:
         cfg.set("oob.domain", oob_domain)
+    if fuzz:
+        cfg.set("scanner.enable_fuzzing", True)
 
     if not cfg.get("api_key") and mode in ("full", "analyze-only"):
         click.echo("⚠️  未配置AI API Key，将使用本地规则分析（功能受限）")
@@ -124,6 +129,14 @@ def scan(targets: str, mode: str, output: str, config: str, verbose: bool, concu
 
         _print_scan_results(results, cfg, output)
 
+        # SARIF 输出
+        if sarif:
+            _save_sarif_report(results, cfg, target_list[0])
+
+        # Exit code 策略
+        if fail_on:
+            _check_fail_on(results, fail_on)
+
 
 def _resolve_targets(targets_str: str) -> list[str]:
     """解析目标参数"""
@@ -163,6 +176,59 @@ def _print_scan_results(results: dict, cfg: VulnForgeConfig, output: str):
         if len(lines) > 30:
             click.echo("...(完整报告请查看文件)")
         click.echo("-" * 50)
+
+
+def _save_sarif_report(results: dict, cfg, target_url: str) -> None:
+    """保存 SARIF 格式报告"""
+    from .utils.sarif import SARIFReport
+
+    summary = results.get("summary", {})
+    findings = results.get("scanner", {}).get("findings", [])
+    scan_id = summary.get("scan_id", "scan_latest")
+
+    report = SARIFReport(tool_version=__version__)
+    for f in findings:
+        report.add_result(
+            vuln_type=f.get("vuln_type", "unknown"),
+            url=f.get("url", target_url),
+            severity=f.get("severity", "medium"),
+            message=f.get("description", ""),
+            evidence=f.get("evidence", ""),
+            param=f.get("param", ""),
+            payload=f.get("payload", ""),
+        )
+
+    report.add_scan_summary(
+        scan_id=scan_id,
+        target_url=target_url,
+        elapsed=summary.get("elapsed_seconds", 0),
+        total_vulns=summary.get("total_vulnerabilities", 0),
+    )
+
+    output_dir = Path(cfg.output_dir) / scan_id
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_path = output_dir / "report.sarif"
+    report.save(str(output_path))
+    click.echo(f"\n📊 SARIF 报告已保存: {output_path}")
+
+
+def _check_fail_on(results: dict, fail_on: str) -> None:
+    """检查是否满足 exit 1 条件"""
+    fail_levels = set(sev.strip().lower() for sev in fail_on.split(","))
+    findings = results.get("scanner", {}).get("findings", [])
+
+    severity_order = {"info": 0, "low": 1, "medium": 2, "high": 3, "critical": 4}
+    max_found = 0
+    for f in findings:
+        sev = f.get("severity", "info").lower()
+        max_found = max(max_found, severity_order.get(sev, 0))
+
+    for level in fail_levels:
+        if level in severity_order and severity_order[level] <= max_found:
+            click.echo(f"\n⚠️  存在 {level} 级别漏洞，--fail-on 策略触发，exit 1")
+            sys.exit(1)
+
+    click.echo(f"✓ 漏洞级别均未达到 --fail-on={fail_on} 阈值")
 
 
 @main.group()

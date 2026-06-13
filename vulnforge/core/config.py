@@ -39,6 +39,7 @@ DEFAULT_CONFIG = {
         "enable_csrf": True,
         "enable_xxe": True,
         "enable_lfi": True,
+        "enable_fuzzing": False,  # 默认关闭，因为 fuzzing 会产生大量请求
         "payload_depth": "normal",
     },
     "auth": {
@@ -63,6 +64,11 @@ DEFAULT_CONFIG = {
         "enable_report": True,
         "temperature": 0.3,
         "max_tokens": 4096,
+    },
+    "fuzzing": {
+        "max_params": 10,     # 最多 fuzz 的参数数
+        "payload_types": "all",  # all / basic / deep
+        "timeout_per_param": 30,  # 每个参数最大 fuzz 时间(秒)
     },
 }
 

@@ -60,12 +60,14 @@ class ScannerRunner:
         client: Optional[httpx.AsyncClient] = None,
         oob: Optional[OOBDetector] = None,
         enable_browser: bool = False,
+        enable_fuzzing: bool = False,
     ):
         self.config = config
         self.target = target
         self.client = client
         self.oob = oob
         self.enable_browser = enable_browser
+        self.enable_fuzzing = enable_fuzzing
         self.findings: list[Finding] = []
         self._seen: set[tuple[str, str, str, str]] = set()
         self.logger = logging.getLogger(__name__)
@@ -193,6 +195,17 @@ class ScannerRunner:
         if nuclei_findings:
             for f in nuclei_findings:
                 self._add_finding(f)
+
+        # 参数模糊测试（响应差异分析）
+        if (self.enable_fuzzing or self.config.get("scanner.enable_fuzzing", False)) and self._get_test_params():
+            try:
+                from ..utils.fuzzer import Fuzzer
+                fuzzer = Fuzzer(self.config, self.target)
+                fuzz_findings = await fuzzer.run(self.client, self.target.base_url, self._get_test_params())
+                for f in fuzz_findings:
+                    self._add_finding(f)
+            except Exception as e:
+                self.logger.warning(f"  [!] 模糊测试异常: {e}")
 
         results = {
             "findings": [f.to_dict() for f in self.findings],
