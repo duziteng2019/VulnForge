@@ -36,7 +36,8 @@ def main():
 @click.option("--fuzz", is_flag=True, help="启用参数模糊测试（响应差异分析）")
 @click.option("--sarif", is_flag=True, help="输出 SARIF 格式报告（GitHub Code Scanning 兼容）")
 @click.option("--fail-on", default="", help="漏洞级别达到此值则 exit 1 (如 'high,critical')")
-def scan(targets: str, mode: str, output: str, config: str, verbose: bool, concurrent: int, cookie: str, auth_url: str, auth_data: str, auth_username: str, auth_password: str, oob_domain: str, fuzz: bool, sarif: bool, fail_on: str):
+@click.option("--ws/--no-ws", default=True, help="启用/禁用 WebSocket 安全测试")
+def scan(targets: str, mode: str, output: str, config: str, verbose: bool, concurrent: int, cookie: str, auth_url: str, auth_data: str, auth_username: str, auth_password: str, oob_domain: str, fuzz: bool, sarif: bool, fail_on: str, ws: bool):
     """🔍 对目标URL进行自动化漏洞扫描"""
     target_list = _resolve_targets(targets)
     if not target_list:
@@ -68,6 +69,7 @@ def scan(targets: str, mode: str, output: str, config: str, verbose: bool, concu
         cfg.set("oob.domain", oob_domain)
     if fuzz:
         cfg.set("scanner.enable_fuzzing", True)
+    cfg.set("scanner.enable_websocket", ws)
 
     if not cfg.get("api_key") and mode in ("full", "analyze-only"):
         click.echo("⚠️  未配置AI API Key，将使用本地规则分析（功能受限）")
@@ -330,6 +332,51 @@ def show(scan_id: str):
     with open(result_file, "r") as f:
         data = json.load(f)
     click.echo(json.dumps(data, ensure_ascii=False, indent=2, default=str))
+
+
+@main.group()
+def plugin():
+    """🔌 插件管理"""
+    pass
+
+
+@plugin.command("list")
+def plugin_list():
+    """列出已安装插件"""
+    from .utils.plugin import PluginManager
+    mgr = PluginManager()
+    plugins = mgr.list_plugins()
+    if not plugins:
+        click.echo("未安装任何插件")
+        return
+    click.echo(f"{'名称':<20} {'类型':<10} {'版本':<8} {'描述'}")
+    click.echo("-" * 60)
+    for p in plugins:
+        click.echo(f"{p['name']:<20} {p['type']:<10} {p['version']:<8} {p['description']}")
+
+
+@plugin.command("install")
+@click.argument("path")
+def plugin_install(path: str):
+    """安装插件（从 .py 文件）"""
+    from .utils.plugin import PluginManager
+    mgr = PluginManager()
+    if mgr.install(path):
+        click.echo(f"✓ 插件安装成功: {path}")
+    else:
+        click.echo(f"✗ 插件安装失败: {path}")
+
+
+@plugin.command("uninstall")
+@click.argument("name")
+def plugin_uninstall(name: str):
+    """卸载插件"""
+    from .utils.plugin import PluginManager
+    mgr = PluginManager()
+    if mgr.uninstall(name):
+        click.echo(f"✓ 插件已卸载: {name}")
+    else:
+        click.echo(f"✗ 插件卸载失败: {name}")
 
 
 if __name__ == "__main__":

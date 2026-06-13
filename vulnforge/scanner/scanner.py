@@ -61,6 +61,7 @@ class ScannerRunner:
         oob: Optional[OOBDetector] = None,
         enable_browser: bool = False,
         enable_fuzzing: bool = False,
+        enable_websocket: bool = False,
     ):
         self.config = config
         self.target = target
@@ -68,6 +69,7 @@ class ScannerRunner:
         self.oob = oob
         self.enable_browser = enable_browser
         self.enable_fuzzing = enable_fuzzing
+        self.enable_websocket = enable_websocket
         self.findings: list[Finding] = []
         self._seen: set[tuple[str, str, str, str]] = set()
         self.logger = logging.getLogger(__name__)
@@ -206,6 +208,15 @@ class ScannerRunner:
                     self._add_finding(f)
             except Exception as e:
                 self.logger.warning(f"  [!] 模糊测试异常: {e}")
+
+        # WebSocket 安全测试
+        if self.enable_websocket or self.config.get("scanner.enable_websocket", False):
+            try:
+                ws_findings = await self._run_websocket_tests()
+                for f in ws_findings:
+                    self._add_finding(f)
+            except Exception as e:
+                self.logger.warning(f"  [!] WebSocket 测试异常: {e}")
 
         results = {
             "findings": [f.to_dict() for f in self.findings],
@@ -734,6 +745,10 @@ class ScannerRunner:
             "/status", "/version", "/build-info",
             # Kubernetes 探针
             "/liveness", "/readiness", "/startup",
+            # WebSocket 端点
+            "/ws", "/socket", "/socket.io", "/ws-url",
+            "/websocket", "/websockets", "/sockjs",
+            "/api/ws", "/api/socket", "/ws/connect",
         ]
 
         for path in common_paths:
@@ -758,6 +773,19 @@ class ScannerRunner:
                         evidence=f"HTTP {resp.status_code} ({len(resp.text)} bytes)",
                         description=f"敏感路径暴露: {path} → {resp.status_code}",
                     ))
+
+                    # 检测 WebSocket 相关路径
+                    path_lower = path.lower()
+                    if any(kw in path_lower for kw in ["/ws", "socket", "ws-url", "websocket", "sockjs"]):
+                        self._add_finding(Finding(
+                            vuln_type="websocket_endpoint",
+                            url=url,
+                            param="",
+                            payload="",
+                            severity="info",
+                            evidence=f"WebSocket 端点: {path} → HTTP {resp.status_code}",
+                            description=f"发现 WebSocket 端点: {path}",
+                        ))
             except Exception:
                 continue
 
@@ -1036,6 +1064,61 @@ class ScannerRunner:
             return []
         except Exception as e:
             self.logger.error(f"  [!] Nuclei扫描异常: {e}")
+            return []
+
+    async def _run_websocket_tests(self) -> list[Finding]:
+        """运行 WebSocket 安全测试
+
+        从 recon 结果中发现 ws/wss 端点，执行 fuzzing
+        """
+        ws_endpoints = []
+
+        # 1. 从 recon_results 中提取 ws:// 和 wss:// 端点
+        if self.recon_results:
+            raw_endpoints = self.recon_results.get("endpoints", [])
+            if isinstance(raw_endpoints, list):
+                for ep in raw_endpoints:
+                    if isinstance(ep, str) and (ep.startswith("ws://") or ep.startswith("wss://")):
+                        ws_endpoints.append(ep)
+
+            # 也检查 endpoints 字典中的 url 字段
+            if isinstance(raw_endpoints, list):
+                for ep in raw_endpoints:
+                    if isinstance(ep, dict):
+                        ep_url = ep.get("url", "")
+                        if ep_url.startswith("ws://") or ep_url.startswith("wss://"):
+                            ws_endpoints.append(ep_url)
+
+        # 2. 从目录扫描结果中找出 WS 相关路径
+        for f in self.findings:
+            if f.vuln_type == "exposed_path" and f.severity in ("high", "medium"):
+                url_lower = f.url.lower()
+                if any(kw in url_lower for kw in ["ws", "socket", "ws-url", "websocket"]):
+                    # 将发现的 HTTP 路径转换为 ws://
+                    ws_url = f.url.replace("https://", "wss://").replace("http://", "ws://")
+                    if ws_url not in ws_endpoints:
+                        ws_endpoints.append(ws_url)
+
+        if not ws_endpoints:
+            return []
+
+        # 3. 运行 WebSocket 测试
+        try:
+            from ..utils.websocket import WebSocketTester
+            tester = WebSocketTester(self.config, self.target)
+            raw_findings = await tester.run(ws_endpoints)
+            findings = []
+            for rf in raw_findings:
+                findings.append(Finding(
+                    vuln_type=rf.get("vuln_type", "websocket/unknown"),
+                    url=rf.get("url", ""),
+                    severity=rf.get("severity", "medium"),
+                    evidence=rf.get("evidence", ""),
+                    description=rf.get("description", ""),
+                ))
+            return findings
+        except ImportError:
+            self.logger.debug("  [!] websockets 库未安装，跳过 WebSocket 测试")
             return []
 
     def _get_test_params(self) -> list[tuple[str, str]]:

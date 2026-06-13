@@ -32,6 +32,7 @@ class ScanEngine:
         self.start_time: float = 0.0
         self.output_dir: Optional[Path] = None
         self.semaphore = asyncio.Semaphore(self.config.get("max_concurrent", 5))
+        self.plugins: list = []
         self.results: dict = {
             "recon": {},
             "scanner": {},
@@ -62,6 +63,9 @@ class ScanEngine:
 
         client = await create_authenticated_client(self.config, timeout=timeout)
 
+        # 加载插件
+        self._load_plugins()
+
         # OOB 检测器初始化
         oob = None
         if self.config.get("oob.enabled", True):
@@ -76,10 +80,14 @@ class ScanEngine:
                 try:
                     if stage == "recon":
                         self.results["recon"] = await self._run_recon(self.output_dir, client)
+                        await self._run_plugins("recon", client)
                     elif stage == "scanner":
                         self.results["scanner"] = await self._run_scanner(self.output_dir, client, oob=oob)
+                        await self._run_plugins("scanner", client)
                     elif stage == "ai":
                         self.results["ai"] = await self._run_ai_analysis(self.output_dir, client)
+                        if self.results.get("ai"):
+                            await self._run_plugins("analyzer", client)
                 except Exception as e:
                     self.logger.error("阶段 %s 出错: %s", stage, e)
                     self.results[stage] = {"error": str(e)}
@@ -105,6 +113,36 @@ class ScanEngine:
 
         self.logger.info("扫描完成 | 耗时: %.1fs | 结果: %s", elapsed, self.output_dir)
         return self.results
+
+    def _load_plugins(self):
+        from ..utils.plugin import PluginLoader
+        loader = PluginLoader()
+        self.plugins = loader.load_all()
+        if self.plugins:
+            self.logger.info("已加载 %d 个插件", len(self.plugins))
+
+    async def _run_plugins(self, stage: str, client) -> None:
+        """执行指定阶段的插件"""
+        if not self.plugins:
+            return
+        for plugin in self.plugins:
+            if plugin.plugin_type == stage:  # recon/scanner/analyzer
+                try:
+                    await plugin.initialize(self.config, self.target)
+                    plugin_results = await plugin.run(
+                        client=client,
+                        findings=self.results.get("scanner", {}).get("findings", []),
+                        recon_results=self.results.get("recon", {}),
+                    )
+                    if plugin_results:
+                        if stage == "scanner":
+                            # 合并 scanner 插件的 finding
+                            self.results["scanner"]["findings"].extend(plugin_results)
+                            self.results["scanner"]["total"] = len(self.results["scanner"]["findings"])
+                        elif stage == "recon":
+                            self.results["recon"].setdefault("plugin_results", []).extend(plugin_results)
+                except Exception as e:
+                    self.logger.error("插件 %s 执行失败: %s", plugin.name, e)
 
     async def _run_recon(self, output_dir: Path, client: httpx.AsyncClient) -> dict:
         """信息收集阶段"""
