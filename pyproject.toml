@@ -25,6 +25,7 @@ classifiers = [
     "Topic :: Security",
     "Topic :: Security :: Vulnerability Management",
 ]
+
 dependencies = [
     "requests>=2.31.0",
     "httpx>=0.27.0",
@@ -35,7 +36,6 @@ dependencies = [
     "pydantic>=2.0.0",
     "jinja2>=3.1.0",
     "aiohttp>=3.9.0",
-    "colorama>=0.4.6",
 ]
 
 [project.urls]

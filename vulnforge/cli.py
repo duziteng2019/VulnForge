@@ -28,11 +28,7 @@ def main():
 @click.option("--verbose", is_flag=True, help="详细输出")
 @click.option("--concurrent", default=3, help="批量扫描并发数（默认3）")
 def scan(targets: str, mode: str, output: str, config: str, verbose: bool, concurrent: int):
-    """🔍 对目标URL进行自动化漏洞扫描
-
-    支持单个目标或批量扫描（传入文件路径或逗号分隔列表）
-    """
-    # 解析目标列表
+    """🔍 对目标URL进行自动化漏洞扫描"""
     target_list = _resolve_targets(targets)
     if not target_list:
         click.echo("❌ 未找到有效的扫描目标")
@@ -55,9 +51,7 @@ def scan(targets: str, mode: str, output: str, config: str, verbose: bool, concu
     engine = ScanEngine(cfg)
 
     if is_batch:
-        # 批量扫描
-        import asyncio as _asyncio
-        sem = _asyncio.Semaphore(concurrent)
+        sem = asyncio.Semaphore(concurrent)
 
         async def scan_one(target_url: str, idx: int) -> dict:
             async with sem:
@@ -70,11 +64,10 @@ def scan(targets: str, mode: str, output: str, config: str, verbose: bool, concu
 
         async def run_batch():
             tasks = [scan_one(t, i + 1) for i, t in enumerate(target_list)]
-            return await _asyncio.gather(*tasks)
+            return await asyncio.gather(*tasks)
 
         all_results = asyncio.run(run_batch())
 
-        # 汇总
         total_vulns = sum(
             r.get("scanner", {}).get("total", 0) or 0
             for r in all_results
@@ -84,7 +77,6 @@ def scan(targets: str, mode: str, output: str, config: str, verbose: bool, concu
         click.echo(f"{'='*50}")
         click.echo(f"  总计: {len(target_list)} 目标, {total_vulns} 漏洞")
 
-        # 按漏洞数排序输出
         sorted_results = sorted(
             all_results,
             key=lambda r: r.get("scanner", {}).get("total", 0) or 0,
@@ -99,7 +91,6 @@ def scan(targets: str, mode: str, output: str, config: str, verbose: bool, concu
             click.echo(f"{target_url:<40} {vulns:<8} {status}")
 
     else:
-        # 单个扫描
         click.echo(f"🛡️  VulnForge v{__version__}")
         click.echo(f"🎯  Target: {target_list[0]}")
         click.echo(f"⚙️   Mode: {mode}")
@@ -111,28 +102,17 @@ def scan(targets: str, mode: str, output: str, config: str, verbose: bool, concu
             click.echo("\n⚠️  扫描被用户中断")
             sys.exit(1)
 
-        # 输出结果
         _print_scan_results(results, cfg, output)
 
 
 def _resolve_targets(targets_str: str) -> list[str]:
-    """解析目标参数，支持文件/逗号分隔/单URL"""
+    """解析目标参数"""
     targets_str = targets_str.strip()
-
-    # 如果是文件路径
     if os.path.isfile(targets_str):
         with open(targets_str, "r", encoding="utf-8") as f:
-            targets = [
-                line.strip() for line in f
-                if line.strip() and not line.startswith("#")
-            ]
-        return targets
-
-    # 如果是逗号分隔
+            return [line.strip() for line in f if line.strip() and not line.startswith("#")]
     if "," in targets_str:
         return [t.strip() for t in targets_str.split(",") if t.strip()]
-
-    # 单URL
     return [targets_str]
 
 
@@ -228,17 +208,13 @@ def history(limit: int):
     """📜 查看扫描历史"""
     cfg = VulnForgeConfig.load()
     scans_dir = Path(cfg.output_dir)
-
     if not scans_dir.exists():
         click.echo("暂无扫描记录")
         return
-
     scan_dirs = sorted(scans_dir.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True)[:limit]
-
     click.echo(f"📜 最近 {len(scan_dirs)} 条扫描记录:")
     click.echo(f"{'Scan ID':<22} {'目标':<40} {'漏洞':<6} {'时间'}")
     click.echo("-" * 80)
-
     for scan_dir in scan_dirs:
         if not scan_dir.is_dir():
             continue
@@ -262,14 +238,11 @@ def show(scan_id: str):
     """📋 查看某次扫描详情"""
     cfg = VulnForgeConfig.load()
     result_file = Path(cfg.output_dir) / scan_id / "results.json"
-
     if not result_file.exists():
         click.echo(f"❌ 未找到扫描记录: {scan_id}")
         return
-
     with open(result_file, "r") as f:
         data = json.load(f)
-
     click.echo(json.dumps(data, ensure_ascii=False, indent=2, default=str))
 
 

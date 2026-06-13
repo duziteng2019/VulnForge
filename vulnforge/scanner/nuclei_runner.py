@@ -2,11 +2,10 @@
 
 import asyncio
 import json
+import logging
 import os
 import subprocess
-import tempfile
 from pathlib import Path
-from typing import Optional
 
 from ..core.config import VulnForgeConfig
 from ..core.target import Target
@@ -23,6 +22,7 @@ class NucleiRunner:
         self.config = config
         self.target = target
         self.templates_dir = NUCLEI_TEMPLATES_DIR
+        self.logger = logging.getLogger(__name__)
 
     async def run(
         self,
@@ -57,8 +57,8 @@ class NucleiRunner:
         result_file = output_dir / "nuclei_results.json"
         cmd = self._build_command(str(result_file), severity, tags)
 
-        print(f"  [→] Nuclei扫描中 (severity={severity})...")
-        print(f"      命令: {' '.join(cmd[:6])} ...")
+        self.logger.info("Nuclei扫描中 (severity=%s)...", severity)
+        self.logger.info("命令: %s ...", " ".join(cmd[:6]))
 
         try:
             process = await asyncio.create_subprocess_exec(
@@ -73,7 +73,7 @@ class NucleiRunner:
             # 解析结果
             findings = self._parse_results(result_file)
 
-            print(f"  [✓] Nuclei发现 {len(findings)} 个漏洞")
+            self.logger.info("Nuclei发现 %d 个漏洞", len(findings))
 
             return {
                 "status": "completed",
@@ -84,10 +84,10 @@ class NucleiRunner:
             }
 
         except asyncio.TimeoutError:
-            print("  [!] Nuclei扫描超时")
+            self.logger.warning("Nuclei扫描超时")
             return {"status": "timeout", "findings": []}
         except Exception as e:
-            print(f"  [!] Nuclei扫描出错: {e}")
+            self.logger.error("Nuclei扫描出错: %s", e)
             return {"status": "error", "error": str(e), "findings": []}
 
     def _build_command(
@@ -109,15 +109,16 @@ class NucleiRunner:
         if tags:
             cmd.extend(["-tags", tags])
 
-        # 限制扫描范围：只扫Web相关模板
-        target_tags = [
-            "cve", "misconfig", "exposure", "vulnerability",
-            "xss", "sqli", "ssrf", "lfi", "rce", "file-read",
-            "tech-detect", "wordpress", "api", "graphql",
-            "spring", "tomcat", "weblogic", "jenkins",
-        ]
-        # 只扫http协议模板
-        cmd.extend(["-t", f"{self.templates_dir}/http/"])
+        # 限制扫描范围：优先扫http协议模板
+        http_templates = f"{self.templates_dir}/http/"
+        if os.path.isdir(http_templates):
+            cmd.extend(["-t", http_templates])
+        else:
+            self.logger.warning(
+                "未找到 http 协议模板目录 (%s)，回退到扫描全部模板",
+                http_templates,
+            )
+
         # 限制严重级别
         cmd.extend(["-severity", "critical,high,medium"])
         # 超时控制

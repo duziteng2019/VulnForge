@@ -1,4 +1,4 @@
-"""目标管理"""
+"""VulnForge 目标管理 — 扫描目标对象"""
 
 from dataclasses import dataclass, field
 from typing import List, Optional

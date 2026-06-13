@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import logging
 import re
 from pathlib import Path
 from typing import Optional
@@ -49,13 +50,53 @@ class Finding:
 class ScannerRunner:
     """漏洞扫描执行器"""
 
-    def __init__(self, config: VulnForgeConfig, target: Target):
+    def __init__(
+        self,
+        config: VulnForgeConfig,
+        target: Target,
+        client: Optional[httpx.AsyncClient] = None,
+    ):
         self.config = config
         self.target = target
+        self.client = client
         self.findings: list[Finding] = []
+        self._seen: set[tuple[str, str, str, str]] = set()
+        self.logger = logging.getLogger(__name__)
+        self.recon_results: dict = {}
 
-    async def run(self, output_dir: Path) -> dict:
-        """执行漏洞扫描"""
+    def _add_finding(self, finding: Finding) -> None:
+        """添加发现，去重检查"""
+        key = (finding.vuln_type, finding.url, finding.param, finding.payload)
+        if key in self._seen:
+            self.logger.debug(f"  去重跳过: {key}")
+            return
+        self._seen.add(key)
+        self.findings.append(finding)
+
+    async def run(
+        self,
+        output_dir: Path,
+        recon_results: Optional[dict] = None,
+        client: Optional[httpx.AsyncClient] = None,
+    ) -> dict:
+        """执行漏洞扫描
+
+        Args:
+            output_dir: 输出目录
+            recon_results: 侦察阶段结果字典，包含 'forms' 等字段
+            client: 共享 httpx.AsyncClient，优先级高于实例级 client
+        """
+        # 客户端优先级：方法参数 > __init__参数 > 自建
+        effective_client = client or self.client
+        if effective_client is None:
+            effective_client = httpx.AsyncClient(timeout=30, verify=False)
+            self._owns_client = True
+        else:
+            self._owns_client = False
+
+        self.client = effective_client
+        self.recon_results = recon_results or {}
+
         tasks = []
 
         if self.config.get("scanner.enable_sqli", True):
@@ -75,7 +116,8 @@ class ScannerRunner:
         # Nuclei扫描（额外深度扫描）
         nuclei_findings = await self._run_nuclei_scan()
         if nuclei_findings:
-            self.findings.extend(nuclei_findings)
+            for f in nuclei_findings:
+                self._add_finding(f)
 
         results = {
             "findings": [f.to_dict() for f in self.findings],
@@ -90,18 +132,24 @@ class ScannerRunner:
         }
 
         # 保存结果
-        with open(output_dir / "scanner.json", "w", encoding="utf-8") as f:
+        output_path = output_dir / "scanner.json"
+        with open(output_path, "w", encoding="utf-8") as f:
             json.dump(results, f, ensure_ascii=False, indent=2, default=str)
 
-        print(f"  [✓] 发现漏洞: {results['total']} 个")
+        self.logger.info(f"  [✓] 发现漏洞: {results['total']} 个")
         for sev, cnt in results["severity_counts"].items():
             if cnt > 0:
-                print(f"       {sev}: {cnt}")
+                self.logger.info(f"       {sev}: {cnt}")
+
+        # 如果我们是自建 client，关闭它
+        if getattr(self, "_owns_client", False):
+            await self.client.aclose()
+            self.client = None
 
         return results
 
     async def _scan_sqli(self) -> None:
-        """SQL注入检测"""
+        """SQL注入检测（GET + POST）"""
         payloads = [
             ("'", "单引号错误检测"),
             ("' OR '1'='1", "布尔注入"),
@@ -141,75 +189,111 @@ class ScannerRunner:
             r"Microsoft OLE DB Provider for ODBC Drivers",
         ]
 
-        async with httpx.AsyncClient(timeout=30, verify=False) as client:
-            for param_name, param_value in self._get_test_params():
-                for payload, label in payloads:
-                    try:
-                        test_url = self._inject_param(
-                            param_name, param_value, payload
-                        )
-                        resp = await client.get(
-                            test_url,
-                            follow_redirects=False,
-                            timeout=10,
-                        )
-                        body = resp.text
-                        # 检测SQL错误
-                        for pattern in error_patterns:
-                            if re.search(pattern, body, re.IGNORECASE):
-                                self.findings.append(Finding(
-                                    vuln_type="sql_injection",
-                                    url=test_url,
-                                    param=param_name,
-                                    payload=payload,
-                                    severity="high",
-                                    evidence=f"匹配到错误模式: {pattern}",
-                                    description=f"SQL注入漏洞 ({label}) — 参数 {param_name} 存在注入风险",
-                                ))
-                                break
-                    except Exception:
-                        continue
-
-            # 时间盲注检测
-            for param_name, param_value in self._get_test_params():
+        # --- GET 测试 ---
+        for param_name, param_value in self._get_test_params():
+            for payload, label in payloads:
                 try:
-                    # 基准请求
-                    start = asyncio.get_event_loop().time()
-                    normal_url = self._inject_param(param_name, param_value, "1")
-                    await client.get(normal_url, timeout=10)
-                    normal_time = asyncio.get_event_loop().time() - start
-
-                    # 延时注入
-                    start = asyncio.get_event_loop().time()
-                    delay_url = self._inject_param(param_name, param_value, "' AND SLEEP(4)-- ")
-                    try:
-                        await client.get(delay_url, timeout=15)
-                        delay_time = asyncio.get_event_loop().time() - start
-                        if delay_time > normal_time + 3:
-                            self.findings.append(Finding(
-                                vuln_type="sql_injection_time_blind",
-                                url=delay_url,
+                    test_url = self._inject_param(param_name, param_value, payload)
+                    resp = await self.client.get(
+                        test_url,
+                        follow_redirects=False,
+                        timeout=10,
+                    )
+                    body = resp.text
+                    for pattern in error_patterns:
+                        if re.search(pattern, body, re.IGNORECASE):
+                            self._add_finding(Finding(
+                                vuln_type="sql_injection",
+                                url=test_url,
                                 param=param_name,
-                                payload="' AND SLEEP(4)-- ",
+                                payload=payload,
                                 severity="high",
-                                evidence=f"延时: {delay_time:.1f}s (基准: {normal_time:.1f}s)",
-                                description=f"时间盲注 — 参数 {param_name} 存在基于时间的SQL注入",
+                                evidence=f"匹配到错误模式: {pattern}",
+                                description=f"SQL注入漏洞 ({label}) — 参数 {param_name} 存在注入风险",
                             ))
-                    except httpx.TimeoutException:
-                        self.findings.append(Finding(
+                            break
+                except Exception:
+                    continue
+
+        # --- GET 时间盲注检测 ---
+        for param_name, param_value in self._get_test_params():
+            try:
+                start = asyncio.get_event_loop().time()
+                normal_url = self._inject_param(param_name, param_value, "1")
+                await self.client.get(normal_url, timeout=10)
+                normal_time = asyncio.get_event_loop().time() - start
+
+                start = asyncio.get_event_loop().time()
+                delay_url = self._inject_param(param_name, param_value, "' AND SLEEP(4)-- ")
+                try:
+                    await self.client.get(delay_url, timeout=15)
+                    delay_time = asyncio.get_event_loop().time() - start
+                    if delay_time > normal_time + 3:
+                        self._add_finding(Finding(
                             vuln_type="sql_injection_time_blind",
                             url=delay_url,
                             param=param_name,
                             payload="' AND SLEEP(4)-- ",
                             severity="high",
-                            evidence="请求超时，可能是延时注入生效",
-                            description=f"时间盲注 — 参数 {param_name} 触发超时，大概率存在注入",
+                            evidence=f"延时: {delay_time:.1f}s (基准: {normal_time:.1f}s)",
+                            description=f"时间盲注 — 参数 {param_name} 存在基于时间的SQL注入",
                         ))
-                except Exception:
-                    continue
+                except httpx.TimeoutException:
+                    self._add_finding(Finding(
+                        vuln_type="sql_injection_time_blind",
+                        url=delay_url,
+                        param=param_name,
+                        payload="' AND SLEEP(4)-- ",
+                        severity="high",
+                        evidence="请求超时，可能是延时注入生效",
+                        description=f"时间盲注 — 参数 {param_name} 触发超时，大概率存在注入",
+                    ))
+            except Exception:
+                continue
+
+        # --- POST 测试（基于侦察阶段发现的表单）---
+        forms = self.recon_results.get("forms", [])
+        if not forms:
+            self.logger.debug("  [i] 无表单数据，跳过SQLi POST测试")
+            return
+
+        for form in forms:
+            action_url = form.get("action", self.target.url)
+            method = form.get("method", "get").lower()
+            input_names = form.get("inputs", [])
+
+            if method != "post":
+                continue
+            if not input_names:
+                continue
+
+            for input_name in input_names:
+                for payload, label in payloads:
+                    try:
+                        resp = await self.client.post(
+                            action_url,
+                            data={input_name: payload},
+                            follow_redirects=False,
+                            timeout=10,
+                        )
+                        body = resp.text
+                        for pattern in error_patterns:
+                            if re.search(pattern, body, re.IGNORECASE):
+                                self._add_finding(Finding(
+                                    vuln_type="sql_injection",
+                                    url=action_url,
+                                    param=input_name,
+                                    payload=payload,
+                                    severity="high",
+                                    evidence=f"POST匹配到错误模式: {pattern}",
+                                    description=f"SQL注入漏洞 (POST/{label}) — 表单参数 {input_name} 存在注入风险",
+                                ))
+                                break
+                    except Exception:
+                        continue
 
     async def _scan_xss(self) -> None:
-        """XSS检测"""
+        """XSS检测（GET + POST）"""
         payloads = [
             ("<script>alert(1)</script>", "反射型XSS基础"),
             ("<img src=x onerror=alert(1)>", "img标签XSS"),
@@ -221,36 +305,71 @@ class ScannerRunner:
             ("<scr<script>ipt>alert(1)</scr<script>ipt>", "嵌套绕过XSS"),
         ]
 
-        async with httpx.AsyncClient(timeout=15, verify=False) as client:
-            for param_name, param_value in self._get_test_params():
+        # --- GET 测试 ---
+        for param_name, param_value in self._get_test_params():
+            for payload, label in payloads:
+                try:
+                    test_url = self._inject_param(param_name, param_value, payload)
+                    resp = await self.client.get(
+                        test_url,
+                        follow_redirects=False,
+                        timeout=10,
+                    )
+                    body = resp.text
+                    if payload in body:
+                        self._add_finding(Finding(
+                            vuln_type="xss_reflected",
+                            url=test_url,
+                            param=param_name,
+                            payload=payload,
+                            severity="medium",
+                            evidence=f"Payload未过滤反射: {payload[:50]}",
+                            description=f"反射型XSS ({label}) — 参数 {param_name} 未正确过滤",
+                        ))
+                except Exception:
+                    continue
+
+        # --- POST 测试（基于侦察阶段发现的表单）---
+        forms = self.recon_results.get("forms", [])
+        if not forms:
+            self.logger.debug("  [i] 无表单数据，跳过XSS POST测试")
+            return
+
+        for form in forms:
+            action_url = form.get("action", self.target.url)
+            method = form.get("method", "get").lower()
+            input_names = form.get("inputs", [])
+
+            if method != "post":
+                continue
+            if not input_names:
+                continue
+
+            for input_name in input_names:
                 for payload, label in payloads:
                     try:
-                        test_url = self._inject_param(
-                            param_name, param_value, payload
-                        )
-                        resp = await client.get(
-                            test_url,
+                        resp = await self.client.post(
+                            action_url,
+                            data={input_name: payload},
                             follow_redirects=False,
                             timeout=10,
                         )
                         body = resp.text
-                        # 检测payload是否未经过滤反射回响应体
                         if payload in body:
-                            self.findings.append(Finding(
+                            self._add_finding(Finding(
                                 vuln_type="xss_reflected",
-                                url=test_url,
-                                param=param_name,
+                                url=action_url,
+                                param=input_name,
                                 payload=payload,
                                 severity="medium",
-                                evidence=f"Payload未过滤反射: {payload[:50]}",
-                                description=f"反射型XSS ({label}) — 参数 {param_name} 未正确过滤",
+                                evidence=f"POST Payload未过滤反射: {payload[:50]}",
+                                description=f"反射型XSS (POST/{label}) — 表单参数 {input_name} 未正确过滤",
                             ))
                     except Exception:
                         continue
 
     async def _scan_ssrf(self) -> None:
         """SSRF检测"""
-        # 使用可检测的外部回调
         payloads = [
             ("http://127.0.0.1:80", "本地回环"),
             ("http://127.0.0.1:443", "本地HTTPS"),
@@ -268,7 +387,6 @@ class ScannerRunner:
             ("gopher://127.0.0.1:6379/", "gopher协议"),
         ]
 
-        # 检测SSRF的关键词
         ssrf_indicators = [
             "Connection refused", "Connection timed out",
             "Failed to connect", "couldn't connect to host",
@@ -276,49 +394,42 @@ class ScannerRunner:
             "Network is unreachable", " timed out",
         ]
 
-        async with httpx.AsyncClient(timeout=15, verify=False) as client:
-            for param_name, param_value in self._get_test_params():
-                # 先检测参数名是否暗示URL
-                param_lower = param_name.lower()
-                is_url_param = any(
-                    kw in param_lower
-                    for kw in ["url", "uri", "link", "src", "href", "file",
-                               "path", "dest", "redirect", "next", "load",
-                               "image", "img", "source", "download", "data"]
-                )
+        for param_name, param_value in self._get_test_params():
+            param_lower = param_name.lower()
+            is_url_param = any(
+                kw in param_lower
+                for kw in ["url", "uri", "link", "src", "href", "file",
+                           "path", "dest", "redirect", "next", "load",
+                           "image", "img", "source", "download", "data"]
+            )
+            if not is_url_param:
+                continue
 
-                if not is_url_param:
+            for payload, label in payloads:
+                try:
+                    test_url = self._inject_param(param_name, param_value, payload)
+                    resp = await self.client.get(
+                        test_url,
+                        follow_redirects=False,
+                        timeout=10,
+                    )
+                    body = resp.text
+                    for indicator in ssrf_indicators:
+                        if indicator.lower() in body.lower():
+                            self._add_finding(Finding(
+                                vuln_type="ssrf",
+                                url=test_url,
+                                param=param_name,
+                                payload=payload,
+                                severity="high",
+                                evidence=f"响应包含: {indicator}",
+                                description=f"SSRF ({label}) — 参数 {param_name} 可能存在SSRF",
+                            ))
+                            break
+                except httpx.ConnectError:
+                    pass
+                except Exception:
                     continue
-
-                for payload, label in payloads:
-                    try:
-                        test_url = self._inject_param(
-                            param_name, param_value, payload
-                        )
-                        resp = await client.get(
-                            test_url,
-                            follow_redirects=False,
-                            timeout=10,
-                        )
-                        body = resp.text
-
-                        for indicator in ssrf_indicators:
-                            if indicator.lower() in body.lower():
-                                self.findings.append(Finding(
-                                    vuln_type="ssrf",
-                                    url=test_url,
-                                    param=param_name,
-                                    payload=payload,
-                                    severity="high",
-                                    evidence=f"响应包含: {indicator}",
-                                    description=f"SSRF ({label}) — 参数 {param_name} 可能存在SSRF",
-                                ))
-                                break
-                    except httpx.ConnectError:
-                        # 连接被拒绝也说明目标解析了我们的地址
-                        pass
-                    except Exception:
-                        continue
 
     async def _scan_cmd_injection(self) -> None:
         """命令注入检测"""
@@ -340,79 +451,127 @@ class ScannerRunner:
             "root:", "bin:", "daemon:",
         ]
 
-        async with httpx.AsyncClient(timeout=15, verify=False) as client:
-            for param_name, param_value in self._get_test_params():
-                for payload, label in payloads:
-                    try:
-                        test_url = self._inject_param(
-                            param_name, param_value, payload
-                        )
-                        resp = await client.get(
-                            test_url,
-                            follow_redirects=False,
-                            timeout=10,
-                        )
-                        body = resp.text
-
-                        for indicator in cmd_success_indicators:
-                            if indicator in body:
-                                self.findings.append(Finding(
-                                    vuln_type="command_injection",
-                                    url=test_url,
-                                    param=param_name,
-                                    payload=payload,
-                                    severity="critical",
-                                    evidence=f"命令执行成功: {indicator}",
-                                    description=f"命令注入 ({label}) — 参数 {param_name} 存在命令执行漏洞",
-                                ))
-                                break
-                    except Exception:
-                        continue
+        for param_name, param_value in self._get_test_params():
+            for payload, label in payloads:
+                try:
+                    test_url = self._inject_param(param_name, param_value, payload)
+                    resp = await self.client.get(
+                        test_url,
+                        follow_redirects=False,
+                        timeout=10,
+                    )
+                    body = resp.text
+                    for indicator in cmd_success_indicators:
+                        if indicator in body:
+                            self._add_finding(Finding(
+                                vuln_type="command_injection",
+                                url=test_url,
+                                param=param_name,
+                                payload=payload,
+                                severity="critical",
+                                evidence=f"命令执行成功: {indicator}",
+                                description=f"命令注入 ({label}) — 参数 {param_name} 存在命令执行漏洞",
+                            ))
+                            break
+                except Exception:
+                    continue
 
     async def _scan_directories(self) -> None:
         """目录/文件扫描"""
         common_paths = [
-            "/admin", "/login", "/wp-admin", "/wp-login.php",
-            "/phpmyadmin", "/pma", "/manager",
-            "/.git/config", "/.env", "/.htaccess",
-            "/robots.txt", "/sitemap.xml",
-            "/backup", "/dump", "/sql",
-            "/api", "/api/v1", "/swagger", "/api-docs",
-            "/actuator", "/actuator/health",
-            "/console", "/h2-console",
-            "/weblogic", "/console/login/LoginForm.jsp",
-            "/jmx-console", "/admin-console",
-            "/solr", "/zookeeper",
-            "/metrics", "/health", "/info",
+            # 通用管理后台
+            "/admin", "/admin/", "/login", "/wp-admin", "/wp-login.php",
+            "/administrator", "/backend", "/manage", "/management",
+            "/dashboard", "/panel", "/cpanel", "/control",
+            # 数据库管理
+            "/phpmyadmin", "/pma", "/manager", "/adminer",
+            "/phppgadmin", "/pgadmin", "/couchdb", "/mongodb",
+            "/redis", "/redis-stats",
+            # 敏感文件
+            "/.git/config", "/.env", "/.htaccess", "/.DS_Store",
+            "/robots.txt", "/sitemap.xml", "/crossdomain.xml",
+            "/web.config", "/.gitignore", "/docker-compose.yml",
+            "/Dockerfile", "/Makefile", "/package.json",
+            "/composer.json", "/Gemfile", "/Gemfile.lock",
+            "/yarn.lock", "/pnpm-lock.yaml",
+            # 备份文件
+            "/backup", "/dump", "/sql", "/db", "/database",
+            "/backups", "/data", "/export", "/import",
+            "/backup.zip", "/backup.tar.gz", "/dump.sql",
+            "/db.sql", "/database.sql", "/db_backup.sql",
+            # API
+            "/api", "/api/v1", "/api/v2", "/api/v3",
+            "/api/swagger", "/api-docs", "/api/health",
+            "/api/version", "/api/status", "/api/info",
+            "/api/login", "/api/admin", "/api/user", "/api/users",
+            "/api/config", "/api/backup", "/api/dump",
+            "/api/export", "/api/import",
+            # Swagger / OpenAPI
+            "/swagger", "/swagger-ui.html", "/swagger-resources",
+            "/v2/api-docs", "/v3/api-docs",
+            "/api/swagger.json", "/api/swagger.yaml",
+            "/openapi.json", "/api/openapi.json",
+            "/swagger/index.html", "/api/docs",
+            # Spring Actuator
+            "/actuator", "/actuator/health", "/actuator/info",
             "/actuator/env", "/actuator/beans",
             "/actuator/configprops", "/actuator/mappings",
             "/actuator/threaddump", "/actuator/heapdump",
+            "/actuator/loggers", "/actuator/prometheus",
+            "/actuator/metrics", "/actuator/scheduledtasks",
+            "/actuator/httptrace", "/actuator/caches",
+            "/actuator/conditions", "/actuator/shutdown",
+            # GraphQL
+            "/graphql", "/graphiql", "/voyager",
+            # Java 监控/管理
+            "/console", "/h2-console", "/h2",
+            "/weblogic", "/console/login/LoginForm.jsp",
+            "/jmx-console", "/admin-console",
+            "/druid/index.html", "/druid/login.html",
+            "/druid/websession.html",
+            # 搜索引擎 / 中间件
+            "/solr", "/zookeeper",
+            "/elasticsearch", "/kibana", "/cerebro",
+            # 监控指标
+            "/metrics", "/prometheus", "/health", "/info",
+            "/env", "/dump", "/trace", "/logfile",
+            "/loggers", "/heapdump", "/threads",
+            "/heap", "/gc", "/cpu", "/memory",
+            "/pool", "/sessions",
+            # Hystrix / 断路器
+            "/hystrix", "/hystrix.stream", "/turbine.stream",
+            # Spring Cloud 配置/刷新
+            "/config", "/refresh", "/restart",
+            "/pause", "/resume", "/service",
+            "/status", "/version", "/build-info",
+            # Kubernetes 探针
+            "/liveness", "/readiness", "/startup",
         ]
 
-        async with httpx.AsyncClient(timeout=10, verify=False) as client:
-            for path in common_paths:
-                try:
-                    url = self.target.resolve_path(path)
-                    resp = await client.get(url, follow_redirects=False, timeout=5)
+        for path in common_paths:
+            try:
+                url = self.target.resolve_path(path)
+                resp = await self.client.get(url, follow_redirects=False, timeout=5)
 
-                    if resp.status_code in (200, 204, 301, 302, 307, 401, 403):
+                if resp.status_code in (200, 204, 301, 302, 307, 401, 403):
+                    if resp.status_code == 200:
+                        severity = "high"
+                    elif resp.status_code in (401, 403):
+                        severity = "info"
+                    else:
                         severity = "medium"
-                        if resp.status_code == 200:
-                            severity = "high"
-                        if resp.status_code == 401 or resp.status_code == 403:
-                            severity = "info"
 
-                        self.findings.append(Finding(
-                            vuln_type="exposed_path",
-                            url=url,
-                            param="",
-                            payload="",
-                            severity=severity,
-                            evidence=f"HTTP {resp.status_code} ({len(resp.text)} bytes)",
-                            description=f"敏感路径暴露: {path} → {resp.status_code}",
-                        ))
-                except Exception:
-                    continue
+                    self._add_finding(Finding(
+                        vuln_type="exposed_path",
+                        url=url,
+                        param="",
+                        payload="",
+                        severity=severity,
+                        evidence=f"HTTP {resp.status_code} ({len(resp.text)} bytes)",
+                        description=f"敏感路径暴露: {path} → {resp.status_code}",
+                    ))
+            except Exception:
+                continue
 
     async def _run_nuclei_scan(self) -> list[Finding]:
         """运行Nuclei深度扫描"""
@@ -438,14 +597,15 @@ class ScannerRunner:
                 ))
 
             if result.get("status") == "skipped":
-                print(f"  [!] Nuclei跳过: {result.get('message', '')}")
+                self.logger.warning(f"  [!] Nuclei跳过: {result.get('message', '')}")
 
             return findings
 
         except ImportError:
+            self.logger.debug("  [!] nuclei_runner 未安装，跳过Nuclei扫描")
             return []
         except Exception as e:
-            print(f"  [!] Nuclei扫描异常: {e}")
+            self.logger.error(f"  [!] Nuclei扫描异常: {e}")
             return []
 
     def _get_test_params(self) -> list[tuple[str, str]]:

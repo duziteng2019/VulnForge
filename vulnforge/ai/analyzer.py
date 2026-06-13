@@ -70,30 +70,30 @@ class AIAnalyzer:
         recon_info = scan_results.get("recon", {})
 
         if not findings:
-            print("  [!] 无漏洞发现，跳过AI分析")
+            self.logger.info("无漏洞发现，跳过AI分析")
             results["status"] = "skipped"
             return results
 
         if not self.api_key:
-            print("  [!] 未配置API Key，使用本地规则分析")
+            self.logger.warning("未配置API Key，使用本地规则分析")
             results["analysis"] = self._local_analysis(findings)
             return results
 
         try:
             # 1. AI漏洞分析
-            print("  [→] AI分析漏洞详情...")
+            self.logger.info("AI分析漏洞详情...")
             analysis = await self._ai_analyze_findings(findings, recon_info)
             results["analysis"] = analysis
 
             # 2. AI POC生成
             if self.config.get("ai.enable_poc_generation", True):
-                print("  [→] AI生成POC...")
+                self.logger.info("AI生成POC...")
                 poc = await self._ai_generate_poc(findings)
                 results["poc"] = poc
 
             # 3. AI报告生成
             if self.config.get("ai.enable_report", True):
-                print("  [→] AI生成报告...")
+                self.logger.info("AI生成报告...")
                 report = await self._ai_generate_report(findings, analysis, recon_info)
                 results["report"] = report
 
@@ -103,7 +103,7 @@ class AIAnalyzer:
                     f.write(report)
 
         except Exception as e:
-            print(f"  [!] AI分析出错: {e}")
+            self.logger.error(f"AI分析出错: {e}")
             results["status"] = "error"
             results["error"] = str(e)
             # Fallback到本地分析
@@ -179,10 +179,10 @@ class AIAnalyzer:
                     # 尝试提取JSON
                     return self._extract_json_array(content, findings)
                 else:
-                    print(f"  [!] API返回异常: {resp.status_code}")
+                    self.logger.error(f"API返回异常: {resp.status_code}")
                     return self._local_analysis(findings)
             except Exception as e:
-                print(f"  [!] API调用失败: {e}")
+                self.logger.error(f"API调用失败: {e}")
                 return self._local_analysis(findings)
 
     async def _ai_generate_poc(self, findings: list) -> list:
