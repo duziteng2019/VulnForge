@@ -1,0 +1,19 @@
+version: "3.8"
+
+services:
+  vulnforge:
+    build: .
+    image: vulnforge:latest
+    container_name: vulnforge
+    command: --help
+    volumes:
+      # 持久化扫描结果和配置
+      - vulnforge_data:/home/vulnforge/.vulnforge
+      # 挂载目标列表
+      - ./targets.txt:/data/targets.txt:ro
+    environment:
+      - VULNFORGE_HOME=/home/vulnforge/.vulnforge
+    network_mode: "host"
+
+volumes:
+  vulnforge_data:

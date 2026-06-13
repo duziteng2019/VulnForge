@@ -36,6 +36,9 @@ DEFAULT_CONFIG = {
         "enable_ssrf": True,
         "enable_cmd_inject": True,
         "enable_dir_scan": True,
+        "enable_csrf": True,
+        "enable_xxe": True,
+        "enable_lfi": True,
         "payload_depth": "normal",
     },
     "auth": {
@@ -48,6 +51,11 @@ DEFAULT_CONFIG = {
     "oob": {
         "enabled": True,
         "domain": "",
+    },
+    "browser": {
+        "enabled": False,
+        "headless": True,
+        "screenshot": False,
     },
     "ai": {
         "enable_analysis": True,
